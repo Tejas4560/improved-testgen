@@ -121,7 +121,7 @@ on:
 
 env:
   PYTHON_VERSION: '3.10'
-  PIPELINE_REPO: 'Tejas4560/Tech_Demo'
+  PIPELINE_REPO: 'Tejas4560/improved-testgen'
   PIPELINE_BRANCH: 'T1'
   GENERATION_TIMEOUT: '600'
   OPENAI_TIMEOUT: '120'
