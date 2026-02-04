@@ -4,9 +4,14 @@ import time
 from typing import Dict, List, Optional
 
 from openai import APIError, APITimeoutError, AzureOpenAI, RateLimitError
+import httpx
 
 # Inline env functions to avoid relative import issues when loaded dynamically
 ENABLE_DEBUG = os.getenv("TESTGEN_DEBUG", "0").lower() in ("1", "true", "yes")
+
+# Timeout configuration (in seconds)
+DEFAULT_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "120"))  # 2 minutes default
+DEFAULT_CONNECT_TIMEOUT = float(os.getenv("OPENAI_CONNECT_TIMEOUT", "30"))  # 30 seconds for connection
 
 def get_any_env(*names: str) -> str:
     """Get environment variable from multiple possible names. Raises RuntimeError if none found."""
@@ -26,16 +31,24 @@ def get_optional_env(*names: str, default: str = "") -> str:
 
 
 def create_client() -> AzureOpenAI:
-    """Create Azure OpenAI client with comprehensive configuration."""
+    """Create Azure OpenAI client with comprehensive configuration and timeout."""
     try:
+        # Configure timeout to prevent indefinite hangs
+        timeout_config = httpx.Timeout(
+            timeout=DEFAULT_TIMEOUT,           # Total timeout for the request
+            connect=DEFAULT_CONNECT_TIMEOUT,   # Timeout for establishing connection
+        )
+
         client = AzureOpenAI(
             api_key=get_any_env("AZURE_OPENAI_KEY", "AZURE_OPENAI_API_KEY"),
             azure_endpoint=get_any_env("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_ENDPOINT"),
             api_version=get_optional_env("AZURE_OPENAI_API_VERSION", "OPENAI_API_VERSION", default="2023-12-01-preview"),
+            timeout=timeout_config,
+            max_retries=2,  # Built-in retry for transient failures
         )
 
         if ENABLE_DEBUG:
-            print(f"Azure OpenAI client created successfully")
+            print(f"Azure OpenAI client created successfully (timeout: {DEFAULT_TIMEOUT}s, connect: {DEFAULT_CONNECT_TIMEOUT}s)")
 
         return client
 
@@ -50,102 +63,122 @@ def get_deployment_name() -> str:
     """Get the deployment name for Azure OpenAI."""
     return get_any_env("AZURE_OPENAI_DEPLOYMENT", "OPENAI_DEPLOYMENT")
 
-def create_chat_completion(client: AzureOpenAI, deployment: str, messages: List[Dict[str, str]], 
-                          max_tokens: Optional[int] = None, temperature: Optional[float] = None) -> str:
+def create_chat_completion(client: AzureOpenAI, deployment: str, messages: List[Dict[str, str]],
+                          max_tokens: Optional[int] = None, temperature: Optional[float] = None,
+                          request_timeout: Optional[float] = None) -> str:
     """
-    Create chat completion with robust error handling and retry logic.
-    
+    Create chat completion with robust error handling, retry logic, and timeout.
+
     Args:
         client: Azure OpenAI client
         deployment: Deployment name
         messages: List of message dicts with 'role' and 'content'
         max_tokens: Maximum tokens to generate (None for model default)
         temperature: Sampling temperature (ignored for Azure OpenAI compatibility)
-    
+        request_timeout: Per-request timeout in seconds (default: 180s)
+
     Returns:
         Generated content as string
-    
+
     Raises:
         RuntimeError: If all retry attempts fail
     """
-    
+
     retry_delays = [1, 3, 6]  # Progressive backoff
     last_error = None
-    
+    effective_timeout = request_timeout or float(os.getenv("OPENAI_REQUEST_TIMEOUT", "180"))  # 3 minutes default
+
+    # Calculate total message size for logging
+    total_chars = sum(len(msg.get("content", "")) for msg in messages)
+    print(f"Starting API call: {len(messages)} messages, ~{total_chars} chars, timeout: {effective_timeout}s")
+
     for attempt, delay in enumerate(retry_delays + [0]):  # Extra attempt without delay
         try:
-            if ENABLE_DEBUG:
-                print(f"Attempt {attempt + 1}: Creating chat completion...")
-            
             # Apply delay for retries
             if delay > 0:
+                print(f"Retry {attempt + 1}/{len(retry_delays) + 1}: waiting {delay}s before retry...")
                 time.sleep(delay)
-            
+
+            print(f"Attempt {attempt + 1}/{len(retry_delays) + 1}: Calling Azure OpenAI API...")
+            start_time = time.time()
+
             # Prepare request parameters - Azure OpenAI specific
             request_params = {
                 "model": deployment,
                 "messages": messages,
+                "timeout": effective_timeout,  # Per-request timeout
             }
-            
+
             # Only add max_tokens if explicitly provided
             if max_tokens is not None:
                 request_params["max_tokens"] = max_tokens
-            
+
             # NOTE: temperature parameter is intentionally omitted
             # Many Azure OpenAI deployments only support the default temperature (1.0)
             # and will return a 400 error if temperature is explicitly set
-            
+
             if ENABLE_DEBUG and temperature is not None:
                 print(f"Note: temperature parameter ({temperature}) ignored for Azure OpenAI compatibility")
-            
+
             response = client.chat.completions.create(**request_params)
-            
+
+            elapsed = time.time() - start_time
+            print(f"API response received in {elapsed:.1f}s")
+
             # Extract content from response
             if response.choices and len(response.choices) > 0:
                 content = response.choices[0].message.content
                 if content:
-                    if ENABLE_DEBUG:
-                        print(f"Successfully generated {len(content)} characters")
+                    print(f"Successfully generated {len(content)} characters in {elapsed:.1f}s")
                     return content
                 else:
                     raise RuntimeError("Empty response content from API")
             else:
                 raise RuntimeError("No choices returned from API")
-                
+
         except RateLimitError as e:
             last_error = f"Rate limit exceeded: {e}"
-            if ENABLE_DEBUG:
-                print(f"Rate limit hit on attempt {attempt + 1}, retrying...")
+            print(f"⚠️ Rate limit hit on attempt {attempt + 1}, will retry...")
             continue
-            
+
         except APITimeoutError as e:
-            last_error = f"API timeout: {e}"
-            if ENABLE_DEBUG:
-                print(f"Timeout on attempt {attempt + 1}, retrying...")
+            elapsed = time.time() - start_time if 'start_time' in locals() else 0
+            last_error = f"API timeout after {elapsed:.1f}s: {e}"
+            print(f"⚠️ Timeout on attempt {attempt + 1} after {elapsed:.1f}s, will retry...")
             continue
-            
+
+        except httpx.TimeoutException as e:
+            elapsed = time.time() - start_time if 'start_time' in locals() else 0
+            last_error = f"HTTP timeout after {elapsed:.1f}s: {e}"
+            print(f"⚠️ HTTP timeout on attempt {attempt + 1} after {elapsed:.1f}s, will retry...")
+            continue
+
+        except httpx.ConnectError as e:
+            last_error = f"Connection error: {e}"
+            print(f"⚠️ Connection failed on attempt {attempt + 1}: {e}")
+            continue
+
         except APIError as e:
             last_error = f"API error: {e}"
             # Check for Azure OpenAI specific parameter errors
-            if e.status_code == 400 and "temperature" in str(e):
-                if ENABLE_DEBUG:
+            if hasattr(e, 'status_code'):
+                if e.status_code == 400 and "temperature" in str(e):
                     print("Azure OpenAI temperature parameter not supported, continuing without it")
-                # This specific error should not be retried
-                raise RuntimeError(f"Azure OpenAI parameter error: {e}")
-            # Some API errors shouldn't be retried
-            elif e.status_code in [400, 401, 403]:
-                raise RuntimeError(f"Non-retryable API error: {e}")
-            if ENABLE_DEBUG:
-                print(f"API error on attempt {attempt + 1}, retrying...")
+                    raise RuntimeError(f"Azure OpenAI parameter error: {e}")
+                # Some API errors shouldn't be retried
+                elif e.status_code in [400, 401, 403]:
+                    print(f"❌ Non-retryable API error (status {e.status_code}): {e}")
+                    raise RuntimeError(f"Non-retryable API error: {e}")
+            print(f"⚠️ API error on attempt {attempt + 1}: {e}")
             continue
-            
+
         except Exception as e:
-            last_error = f"Unexpected error: {e}"
-            if ENABLE_DEBUG:
-                print(f"Unexpected error on attempt {attempt + 1}: {e}")
+            last_error = f"Unexpected error: {type(e).__name__}: {e}"
+            print(f"⚠️ Unexpected error on attempt {attempt + 1}: {type(e).__name__}: {e}")
             continue
-    
+
     # All attempts failed
+    print(f"❌ All {len(retry_delays) + 1} attempts failed. Last error: {last_error}")
     raise RuntimeError(f"Chat completion failed after {len(retry_delays) + 1} attempts. Last error: {last_error}")
 
 def validate_client_configuration() -> bool:

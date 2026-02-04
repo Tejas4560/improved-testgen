@@ -6,6 +6,16 @@ echo "Starting Enhanced AI Test Generation Pipeline"
 echo "=================================================================="
 echo ""
 
+# ===== TIMEOUT CONFIGURATION =====
+# These can be overridden via environment variables:
+#   GENERATION_TIMEOUT - Timeout for AI test generation (default: 600s / 10 min)
+#   OPENAI_TIMEOUT - Timeout for OpenAI client (default: 120s)
+#   OPENAI_CONNECT_TIMEOUT - Timeout for OpenAI connection (default: 30s)
+#   OPENAI_REQUEST_TIMEOUT - Timeout per API request (default: 180s)
+#
+# Example: GENERATION_TIMEOUT=900 ./pipeline_runner.sh
+# ================================
+
 # Set directory paths
 export CURRENT_DIR="$(pwd)"
 export TARGET_DIR="$(pwd)/target_repo"
@@ -360,12 +370,24 @@ PYCODE
 
   rm -rf "./tests/generated"
 
-  if ! python multi_iteration_orchestrator.py \
+  # Set timeout for AI generation (default 10 minutes per iteration, 3 iterations = 30 min max)
+  GENERATION_TIMEOUT=${GENERATION_TIMEOUT:-600}
+  TOTAL_TIMEOUT=$((GENERATION_TIMEOUT * 3))
+
+  echo "Starting gap-based AI test generation (timeout: ${TOTAL_TIMEOUT}s)..."
+  if ! timeout --signal=SIGTERM --kill-after=30 "$TOTAL_TIMEOUT" \
+    python multi_iteration_orchestrator.py \
     --target "$TARGET_DIR" \
     --iterations 3 \
     --target-coverage "$MIN_COVERAGE" \
     --outdir "$CURRENT_DIR/tests/generated"; then
-    echo "Warning: AI test generation had issues, but continuing..."
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 124 ]; then
+      echo "Error: AI test generation timed out after ${TOTAL_TIMEOUT}s"
+      echo "Try increasing GENERATION_TIMEOUT or check Azure OpenAI connectivity"
+    else
+      echo "Warning: AI test generation had issues (exit code: $EXIT_CODE), but continuing..."
+    fi
   fi
 
   if [ -d "./tests/generated" ]; then
@@ -585,9 +607,19 @@ else
   exit 1
 fi
 
-echo "Generating AI tests..."
-if ! python -m src.gen --target "$TARGET_DIR" --outdir "$CURRENT_DIR/tests/generated" --force; then
-  echo "Warning: AI test generation had issues, but continuing..."
+# Set timeout for AI generation (default 10 minutes)
+GENERATION_TIMEOUT=${GENERATION_TIMEOUT:-600}
+
+echo "Generating AI tests (timeout: ${GENERATION_TIMEOUT}s)..."
+if ! timeout --signal=SIGTERM --kill-after=30 "$GENERATION_TIMEOUT" \
+  python -m src.gen --target "$TARGET_DIR" --outdir "$CURRENT_DIR/tests/generated" --force; then
+  EXIT_CODE=$?
+  if [ $EXIT_CODE -eq 124 ]; then
+    echo "Error: AI test generation timed out after ${GENERATION_TIMEOUT}s"
+    echo "Try increasing GENERATION_TIMEOUT or check Azure OpenAI connectivity"
+  else
+    echo "Warning: AI test generation had issues (exit code: $EXIT_CODE), but continuing..."
+  fi
 fi
 
 if [ -d "./tests/generated" ]; then

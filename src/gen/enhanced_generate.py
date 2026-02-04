@@ -184,15 +184,18 @@ class UniversalTestUtils:
     return str(conftest_path)
 
 def _generate_with_universal_retry(messages: List[Dict], max_attempts: int = 5) -> str:
-    """Generate test code with UNIVERSAL retry logic."""
-    from .openai_client import (APIError, RateLimitError,
+    """Generate test code with UNIVERSAL retry logic and timeout handling."""
+    from .openai_client import (APIError, APITimeoutError, RateLimitError,
                                 create_chat_completion, create_client,
                                 get_deployment_name)
-    
+    import httpx
+
     client = create_client()
     deployment = get_deployment_name()
     last_error = "unknown error"
     backoff_delays = [0, 2, 4, 8, 16]  # Exponential backoff
+
+    print(f"Starting test generation with {max_attempts} max attempts...")
     
     for attempt in range(max_attempts):
         try:
@@ -285,20 +288,39 @@ def _generate_with_universal_retry(messages: List[Dict], max_attempts: int = 5) 
                 
         except RateLimitError as e:
             last_error = f"Rate limit exceeded: {e}"
-            print(f"Rate limit hit on attempt {attempt + 1}, backing off...")
-            
+            print(f"⚠️ Rate limit hit on attempt {attempt + 1}, backing off...")
+
+        except APITimeoutError as e:
+            last_error = f"API timeout: {e}"
+            print(f"⚠️ API timeout on attempt {attempt + 1}, will retry with longer timeout...")
+
+        except httpx.TimeoutException as e:
+            last_error = f"HTTP timeout: {e}"
+            print(f"⚠️ HTTP timeout on attempt {attempt + 1}, will retry...")
+
+        except httpx.ConnectError as e:
+            last_error = f"Connection error: {e}"
+            print(f"⚠️ Connection failed on attempt {attempt + 1}, will retry...")
+
         except APIError as e:
             last_error = f"API error: {e}"
             if hasattr(e, 'status_code') and e.status_code in [400, 401, 403]:
-                print(f"Non-retryable API error: {e}")
+                print(f"❌ Non-retryable API error: {e}")
                 break
-            print(f"API error on attempt {attempt + 1}, retrying...")
-            
+            print(f"⚠️ API error on attempt {attempt + 1}, retrying...")
+
         except Exception as e:
-            last_error = f"API call failed: {e}"
-            print(f"Generation attempt {attempt + 1} failed: {e}")
+            last_error = f"API call failed: {type(e).__name__}: {e}"
+            print(f"⚠️ Generation attempt {attempt + 1} failed: {type(e).__name__}: {e}")
     
     # If all attempts failed, raise with detailed error
+    print(f"❌ All {max_attempts} generation attempts failed")
+    print(f"Last error: {last_error}")
+    print("Troubleshooting tips:")
+    print("  - Check Azure OpenAI credentials and endpoint")
+    print("  - Increase OPENAI_TIMEOUT environment variable")
+    print("  - Check network connectivity to Azure")
+    print("  - Verify deployment name is correct")
     raise RuntimeError(f"UNIVERSAL test generation failed after {max_attempts} attempts. Last error: {last_error}")
 
 def _optimize_for_universal_coverage(code: str) -> str:
