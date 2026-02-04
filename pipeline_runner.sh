@@ -1,0 +1,773 @@
+#!/bin/bash
+set -euo pipefail
+trap 'echo "Script failed at line $LINENO"; exit 1' ERR
+
+echo "Starting Enhanced AI Test Generation Pipeline"
+echo "=================================================================="
+echo ""
+
+# Set directory paths
+export CURRENT_DIR="$(pwd)"
+export TARGET_DIR="$(pwd)/target_repo"
+export TARGET_ROOT="$TARGET_DIR"
+export PYTHONPATH="$TARGET_DIR"
+export PATH="$CURRENT_DIR/venv/sonar-scanner/bin:$PATH"
+
+echo "Pipeline Directory: $CURRENT_DIR"
+echo "Target Repository: $TARGET_DIR"
+echo ""
+
+check_final_coverage() {
+    MIN_COVERAGE="${MIN_COVERAGE_THRESHOLD:-90}"
+    
+    if [ ! -f "coverage.xml" ]; then
+        echo "coverage.xml not found"
+        exit 1
+    fi
+
+    COVERAGE=$(python3 -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f'{float(root.attrib.get(\"line-rate\", 0)) * 100:.2f}')")
+    
+    echo "Coverage: ${COVERAGE}% | Threshold: ${MIN_COVERAGE}%"
+    
+    if (( $(echo "$COVERAGE >= $MIN_COVERAGE" | bc -l) )); then
+        exit 0
+    else
+        exit 1
+    fi
+}
+
+# Verify target directory exists
+if [ ! -d "$TARGET_DIR" ]; then
+  echo "Target directory not found: $TARGET_DIR"
+  exit 1
+fi
+
+# Clean all coverage artifacts before starting
+echo "Cleaning previous coverage data..."
+rm -f .coverage coverage.xml
+rm -rf htmlcov/ .pytest_cache/
+find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+find "$TARGET_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+echo "Clearing all stale test caches..."
+rm -rf "$CURRENT_DIR/tests/manual"
+rm -rf "$CURRENT_DIR/tests/generated"
+rm -rf "$CURRENT_DIR/.pytest_cache"
+find "$CURRENT_DIR" -name "*.pyc" -delete 2>/dev/null || true
+find "$CURRENT_DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+rm -f "$CURRENT_DIR/.coverage" "$TARGET_DIR/.coverage"
+rm -rf "$CURRENT_DIR/.scannerwork" "$TARGET_DIR/.scannerwork"
+rm -rf .codebase_index/
+rm -f \
+  .pytest_combined.json \
+  .pytest_generated.json \
+  .pytest_manual.json \
+  auto_fixer_report.json \
+  coverage_gaps.json \
+  iteration_report.json \
+  manual_test_result.json \
+  pytest_report.json
+echo "All stale caches removed"
+echo ""
+
+# Ensure pytest-json-report is installed
+echo "Installing pytest-json-report for auto-fix feature..."
+pip install -q pytest-json-report || { echo "Failed to install pytest-json-report"; exit 1; }
+echo ""
+
+# Detect Manual Tests
+echo "Running detect_manual_tests.py on target repo..."
+if ! python src/detect_manual_tests.py "$TARGET_DIR"; then
+  echo "Warning: Manual test detection failed, but continuing..."
+fi
+
+# Check if manual_test_result.json exists and is valid
+if [ ! -f "manual_test_result.json" ]; then
+  echo "Error: manual_test_result.json not found after detection"
+  exit 1
+fi
+
+if ! python3 -c "import json; json.load(open('manual_test_result.json'))" >/dev/null 2>&1; then
+  echo "Error: manual_test_result.json is not valid JSON"
+  exit 1
+fi
+
+FOUND=$(python3 -c "import json; print(json.load(open('manual_test_result.json'))['manual_tests_found'])" 2>/dev/null || echo "false")
+PATHS=$(python3 -c "import json; print(' '.join(json.load(open('manual_test_result.json'))['manual_test_paths']))" 2>/dev/null || echo "")
+
+echo ""
+echo "Manual Tests Found: $FOUND"
+echo "Test Paths: $PATHS"
+echo ""
+
+# Set minimum coverage threshold (default from env or 90)
+MIN_COVERAGE=${MIN_COVERAGE_THRESHOLD:-90}
+echo "Minimum Coverage Threshold: ${MIN_COVERAGE}%"
+echo ""
+
+# -------------------------------------------------------------------
+# CASE 1: Manual Tests Found - Run and Analyze Coverage
+# -------------------------------------------------------------------
+if [[ "${FOUND,,}" == "true" ]]; then
+  echo "Manual test cases detected. Running pytest with coverage analysis..."
+  echo ""
+
+  export JSON_FILE="manual_test_result.json"
+  export TEST_PATHS=$(python3 - <<'PYCODE'
+import json
+try:
+    with open("manual_test_result.json") as f:
+        data = json.load(f)
+    print(" ".join(data.get("manual_test_paths", [])))
+except:
+    print("")
+PYCODE
+)
+
+  # Install project dependencies if requirements.txt exists
+  if [ -f "$TARGET_DIR/requirements.txt" ]; then
+    echo "Installing project dependencies from target repo..."
+    if ! pip install -q -r "$TARGET_DIR/requirements.txt"; then
+      echo "Error: Failed to install project dependencies"
+      exit 1
+    fi
+  else
+    echo "No requirements.txt found in target repo"
+    exit 1
+  fi
+  echo ""
+
+  echo "Copying all tests to local folder: ./tests/manual"
+  rm -rf "./tests/manual"
+  mkdir -p ./tests/manual
+
+  # Copy ALL tests to tests/manual (no distinction between manual/AI)
+  if ! python3 - <<'PYCODE'
+import json
+import os
+import shutil
+
+try:
+    with open("manual_test_result.json") as f:
+        data = json.load(f)
+
+    test_root = data.get("test_root", "")
+    files_by_rel_path = data.get("files_by_relative_path", {})
+
+    if not files_by_rel_path:
+        print("No test files found in manual_test_result.json")
+        exit(0)
+
+    print(f"Test root: {test_root}")
+    print(f"Copying {len(files_by_rel_path)} test files...")
+
+    copied_count = 0
+
+    # Copy all tests
+    for rel_path, full_path in files_by_rel_path.items():
+        # Special handling for conftest.py - copy to top level to avoid "non-top-level conftest" error
+        if os.path.basename(full_path) == "conftest.py":
+            dest_path = os.path.join("./tests/manual", "conftest.py")
+            print(f"{rel_path} → conftest.py (top-level)")
+        else:
+            dest_path = os.path.join("./tests/manual", rel_path)
+            print(f"{rel_path}")
+
+        dest_dir = os.path.dirname(dest_path)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        try:
+            shutil.copy2(full_path, dest_path)
+            copied_count += 1
+        except Exception as e:
+            print(f"Failed to copy {rel_path}: {e}")
+
+    print(f"Copied {copied_count}/{len(files_by_rel_path)} test files")
+except Exception as e:
+    print(f"Error during test copy: {e}")
+    exit(1)
+PYCODE
+  then
+    echo "Error: Failed to copy tests"
+    exit 1
+  fi
+
+  echo ""
+  if ! find ./tests/manual -type f -name 'test_*.py' 2>/dev/null; then
+    echo "No test files found after copying"
+  fi
+  echo ""
+
+  find ./tests/manual -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+  echo "Running manual tests with coverage analysis..."
+  echo ""
+
+  MANUAL_TEST_EXIT_CODE=0
+  if pytest "$CURRENT_DIR/tests/manual" \
+    --cov="$TARGET_DIR" \
+    --cov-config=pytest.ini \
+    --cov-report=term-missing \
+    --cov-report=xml \
+    --cov-report=html \
+    --cov-fail-under=0 \
+    --json-report \
+    --junitxml="$CURRENT_DIR/test-results.xml" \
+    --json-report-file="$CURRENT_DIR/.pytest_manual.json" \
+    -v; then
+    MANUAL_TEST_EXIT_CODE=0
+    echo "All manual tests passed"
+  else
+    MANUAL_TEST_EXIT_CODE=1
+    echo "Warning: Manual tests had failures, but continuing..."
+  fi
+
+  # Auto-fix failing manual tests if any failures detected
+  if [ $MANUAL_TEST_EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo "Some manual tests failed"
+    echo "Starting auto-fix for failing manual tests..."
+    echo ""
+    if ! python run_auto_fixer.py \
+      --test-dir "$CURRENT_DIR/tests/manual" \
+      --project-root "$TARGET_DIR" \
+      --max-iterations 3; then
+      echo "Warning: Auto-fixer had issues, but continuing..."
+    fi
+    echo ""
+    echo "Re-running manual tests after auto-fix..."
+    if pytest "$CURRENT_DIR/tests/manual" \
+      --cov="$TARGET_DIR" \
+      --cov-config=pytest.ini \
+      --cov-report=term-missing \
+      --cov-report=xml \
+      --cov-report=html \
+      --cov-fail-under=0 \
+      --json-report \
+      --junitxml="$CURRENT_DIR/test-results.xml" \
+      --json-report-file="$CURRENT_DIR/.pytest_manual_fixed.json" \
+      -v; then
+      MANUAL_TEST_EXIT_CODE=0
+      echo "tests passed after auto-fix!"
+    else
+      MANUAL_TEST_EXIT_CODE=1
+      echo "Warning: Re-run all tests still have failures!"
+    fi
+  fi
+
+
+  echo "Coverage report generated"
+  if ! coverage report --show-missing; then
+    echo "Warning: Coverage report generation had issues"
+  fi
+  echo ""
+
+  # Parse coverage from coverage.xml
+  if [ -f coverage.xml ]; then
+    if ! COVERAGE=$(python3 -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f'{float(root.attrib.get(\"line-rate\", 0)) * 100:.2f}')" 2>/dev/null); then
+      echo "Error: Failed to parse coverage.xml"
+      COVERAGE=0
+    else
+      echo "Manual Test Coverage: $COVERAGE%"
+    fi
+
+    echo ""
+    echo "Coverage Summary:"
+    if ! python3 - <<'PYCODE'
+import xml.etree.ElementTree as ET
+try:
+    tree = ET.parse('coverage.xml')
+    root = tree.getroot()
+    for pkg in root.findall('.//package'):
+        for cls in pkg.findall('.//class'):
+            filename = cls.get('filename')
+            line_rate = float(cls.get('line-rate', 0)) * 100
+            print(f"  {filename}: {line_rate:.1f}%")
+except Exception as e:
+    print(f"Error generating coverage summary: {e}")
+PYCODE
+    then
+      echo "Error generating coverage summary"
+    fi
+  else
+    COVERAGE=0
+    echo "No coverage.xml found"
+  fi
+
+  echo ""
+  echo "=================================================================="
+  echo "COVERAGE CHECK"
+  echo "=================================================================="
+
+  # Check if coverage >= 90%
+  if (( $(echo "$COVERAGE >= $MIN_COVERAGE" | bc -l) )); then
+    echo "Quality Gate Passed: Coverage ${COVERAGE}% >= ${MIN_COVERAGE}%"
+    echo "No AI test generation needed!"
+    echo ""
+
+    # Upload to SonarQube
+    if [ -n "${SONAR_HOST_URL:-}" ] && [ -n "${SONAR_TOKEN:-}" ]; then
+      echo "Uploading results to SonarQube..."
+      rsync -av --exclude "__pycache__/" --exclude="conftest.py" "$CURRENT_DIR/tests/manual/" "$TARGET_DIR/tests/manual/"
+      if ! sonar-scanner \
+        -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+        -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+        -Dsonar.host.url="$SONAR_HOST_URL" \
+        -Dsonar.token="$SONAR_TOKEN" \
+        -Dproject.settings="$CURRENT_DIR/sonar-project.properties" \
+        -Dsonar.projectBaseDir="$TARGET_DIR" \
+        -Dsonar.sources="$TARGET_DIR" \
+        -Dsonar.tests="$TARGET_DIR/tests/manual/" \
+        -Dsonar.python.xunit.reportPath="$CURRENT_DIR/test-results.xml" \
+        -Dsonar.python.coverage.reportPaths="$CURRENT_DIR/coverage.xml"; then
+        echo "Warning: SonarQube upload failed"
+        exit 1
+      else
+        echo "SonarQube upload complete!"
+      fi
+    else
+      echo "SonarQube credentials not provided, skipping upload"
+    fi
+
+    echo "Pipeline completed successfully!"
+    exit 0
+  fi
+
+  # Coverage < 90% - Proceed with AI test generation
+  echo "Coverage is below ${MIN_COVERAGE}%"
+  echo "Initiating Gap-Based AI Test Generation..."
+  echo ""
+
+  # Analyze Coverage Gaps
+  echo "Analyzing coverage gaps..."
+  if ! python src/coverage_gap_analyzer.py \
+    --target "$TARGET_DIR" \
+    --current-dir "$CURRENT_DIR" \
+    --output coverage_gaps.json; then
+    echo "Warning: Coverage gap analysis failed, but continuing..."
+  fi
+
+  echo ""
+
+  export GAP_FOCUSED_MODE=true
+  export COVERAGE_GAPS_FILE="$CURRENT_DIR/coverage_gaps.json"
+  export TESTGEN_FORCE=true
+
+  echo "=================================================================="
+  echo "GAP-BASED AI TEST GENERATION"
+  echo "=================================================================="
+  echo ""
+
+  rm -rf "./tests/generated"
+
+  if ! python multi_iteration_orchestrator.py \
+    --target "$TARGET_DIR" \
+    --iterations 3 \
+    --target-coverage "$MIN_COVERAGE" \
+    --outdir "$CURRENT_DIR/tests/generated"; then
+    echo "Warning: AI test generation had issues, but continuing..."
+  fi
+
+  if [ -d "./tests/generated" ]; then
+    TEST_COUNT=$(find "./tests/generated" -name 'test_*.py' -type f | wc -l)
+    echo "Total AI-generated test files: $TEST_COUNT"
+    if ! find "./tests/generated" -name 'test_*.py' -type f | head -10; then
+      echo "No test files found in generated directory"
+    fi
+  else
+    echo "No tests generated!"
+    TEST_COUNT=0
+  fi
+
+  echo ""
+
+  if [ $TEST_COUNT -gt 0 ]; then
+    echo "Gap-based AI test generation completed"
+    echo ""
+
+    echo "=================================================================="
+    echo "RUNNING COMBINED TESTS (Manual + AI Generated)"
+    echo "=================================================================="
+    echo ""
+
+    find ./tests/generated -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+    echo "Running combined test suite..."
+    COMBINED_TEST_EXIT_CODE=0
+    if pytest "$CURRENT_DIR/tests/manual" "$CURRENT_DIR/tests/generated" \
+      --cov="$TARGET_DIR" \
+      --cov-config=pytest.ini \
+      --cov-report=term-missing \
+      --cov-report=xml \
+      --cov-report=html \
+      --cov-fail-under=0 \
+      --json-report \
+      --junitxml="$CURRENT_DIR/test-results.xml" \
+      --json-report-file="$CURRENT_DIR/.pytest_combined.json" \
+      -v; then
+      COMBINED_TEST_EXIT_CODE=0
+      echo "All ai-test cases are pass"
+    else
+      COMBINED_TEST_EXIT_CODE=1
+      echo "Warning: AI-generated tests had failures"
+    fi
+
+    echo ""
+
+    if [ $COMBINED_TEST_EXIT_CODE -ne 0 ]; then
+      echo "Some combined tests failed"
+      echo "Starting auto-fix for failing generated tests..."
+      echo ""
+
+      if ! python run_auto_fixer.py \
+        --test-dir "$CURRENT_DIR/tests/generated" \
+        --project-root "$TARGET_DIR" \
+        --max-iterations 3; then
+        echo "Warning: Auto-fixer had issues, but continuing..."
+      fi
+
+      echo ""
+      echo "Re-running tests after auto-fix..."
+      if ! pytest "$CURRENT_DIR/tests/manual" "$CURRENT_DIR/tests/generated" \
+        --cov="$TARGET_DIR" \
+        --cov-config=pytest.ini \
+        --cov-report=term-missing \
+        --cov-report=xml \
+        --cov-report=html \
+        --cov-fail-under=0 \
+        --json-report \
+        --junitxml="$CURRENT_DIR/test-results.xml" \
+        --json-report-file="$CURRENT_DIR/.pytest_combined_auto_fixer.json" \
+        -v; then
+        echo "Warning: Re-run tests still have failures"
+      fi
+    fi
+
+    echo ""
+    echo "Final Coverage Analysis:"
+    if ! coverage report --show-missing; then
+      echo "Warning: Final coverage report had issues"
+    fi
+
+    if [ -f coverage.xml ]; then
+      if FINAL_COVERAGE=$(python3 -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f'{float(root.attrib.get(\"line-rate\", 0)) * 100:.2f}')" 2>/dev/null); then
+        echo ""
+        echo "=================================================================="
+        echo "FINAL RESULTS"
+        echo "=================================================================="
+        echo "Manual Test Coverage:   $COVERAGE%"
+        echo "Final Coverage:         $FINAL_COVERAGE%"
+        echo "Coverage Improvement:   $(python3 -c "print(f'{float($FINAL_COVERAGE) - float($COVERAGE):.2f}%')")"
+        echo ""
+
+        # Copy AI-generated tests to target repository and commit
+        if [ -d "$CURRENT_DIR/tests/generated" ]; then
+          TARGET_TESTS_DIR="$TARGET_DIR/tests/generated"
+          echo "Copying AI-generated tests to target repository: $TARGET_TESTS_DIR"
+          mkdir -p "$TARGET_TESTS_DIR"
+          rsync -av --exclude "__pycache__/" --exclude="*.pyc" "$CURRENT_DIR/tests/generated/" "$TARGET_TESTS_DIR/"
+          echo "AI-generated tests copied to target repository successfully"
+
+          # Commit to target repository if it's a git repo
+          if [ -d "$TARGET_DIR/.git" ]; then
+            echo ""
+            echo "Committing AI-generated tests to target repository..."
+            cd "$TARGET_DIR"
+
+            # Configure git user if not already set
+            if [ -z "$(git config user.email)" ]; then
+              git config user.email "${GIT_USER_EMAIL:-ci-bot@example.com}"
+              git config user.name "${GIT_USER_NAME:-CI Bot}"
+            fi
+
+            git add tests/generated/
+
+            if ! git diff --cached --quiet 2>/dev/null; then
+              git commit -m "chore: add AI-generated test cases
+
+Auto-generated test cases from pipeline run
+Coverage improvement: $(python3 -c "print(f'{float($FINAL_COVERAGE) - float($COVERAGE):.2f}%')")
+Final coverage: ${FINAL_COVERAGE}%"
+              echo "AI-generated tests committed to target repository"
+
+              # Push to remote if GIT_PUSH_TOKEN is provided
+              if [ -n "${GIT_PUSH_TOKEN:-}" ]; then
+                echo "Pushing changes to remote repository..."
+
+                # Get current branch
+                CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+                # Get remote URL
+                REMOTE_URL=$(git config --get remote.origin.url)
+
+                # Configure git to use token for authentication
+                if [[ "$REMOTE_URL" == https://* ]]; then
+                  # HTTPS URL - use token authentication
+                  git push https://${GIT_PUSH_TOKEN}@${REMOTE_URL#https://} "$CURRENT_BRANCH" 2>&1 || {
+                    echo "Warning: Failed to push to remote repository"
+                  }
+                else
+                  # SSH URL or other - try normal push
+                  git push origin "$CURRENT_BRANCH" 2>&1 || {
+                    echo "Warning: Failed to push to remote repository"
+                  }
+                fi
+
+                echo "Changes pushed to remote repository successfully"
+              else
+                echo "Skipping push: GIT_PUSH_TOKEN not provided (set GIT_PUSH_TOKEN environment variable to enable auto-push)"
+              fi
+            else
+              echo "No new AI tests to commit"
+            fi
+
+            cd "$CURRENT_DIR"
+          else
+            echo "Warning: Target directory is not a git repository, AI tests not committed"
+          fi
+        fi
+      else
+        echo "Error: Failed to parse final coverage"
+      fi
+    fi
+
+    # Upload to SonarQube
+    if [ -n "${SONAR_HOST_URL:-}" ] && [ -n "${SONAR_TOKEN:-}" ]; then
+      echo "Uploading results to SonarQube..."
+      rsync -av --exclude "__pycache__/" --exclude="conftest.py" "$CURRENT_DIR/tests/manual/" "$TARGET_DIR/tests/manual/"
+      rsync -av --exclude "__pycache__/" --exclude="conftest.py" "$CURRENT_DIR/tests/generated/" "$TARGET_DIR/tests/generated/"
+      if ! sonar-scanner \
+        -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+        -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+        -Dsonar.host.url="$SONAR_HOST_URL" \
+        -Dsonar.token="$SONAR_TOKEN" \
+        -Dproject.settings="$CURRENT_DIR/sonar-project.properties" \
+        -Dsonar.projectBaseDir="$TARGET_DIR" \
+        -Dsonar.sources="$TARGET_DIR" \
+        -Dsonar.tests="$TARGET_DIR/tests/manual/,$TARGET_DIR/tests/generated/" \
+        -Dsonar.python.xunit.reportPath="$CURRENT_DIR/test-results.xml" \
+        -Dsonar.python.coverage.reportPaths="$CURRENT_DIR/coverage.xml"; then
+        echo "Warning: SonarQube upload failed"
+        exit 1
+      else
+        echo "SonarQube upload complete!"
+      fi
+    else
+      echo "SonarQube credentials not provided, skipping upload"
+    fi
+
+    check_final_coverage
+  else
+    echo "No AI tests were generated"
+    echo "Coverage remains at ${COVERAGE}%"
+    exit 0
+  fi
+fi
+
+# -------------------------------------------------------------------
+# CASE 2: No Manual Tests Found -> Generate Full AI Tests
+# -------------------------------------------------------------------
+echo "No manual tests found. Proceeding with full AI Test Generation..."
+echo ""
+
+export TESTGEN_FORCE=true
+rm -rf "./tests/generated"
+
+# Install target dependencies
+if [ -f "$TARGET_DIR/requirements.txt" ]; then
+  echo "Installing project dependencies from target repo..."
+  if ! pip install -q -r "$TARGET_DIR/requirements.txt"; then
+    echo "Error: Failed to install project dependencies"
+    exit 1
+  fi
+else
+  echo "No requirements.txt found in target repo"
+  exit 1
+fi
+
+echo "Generating AI tests..."
+if ! python -m src.gen --target "$TARGET_DIR" --outdir "$CURRENT_DIR/tests/generated" --force; then
+  echo "Warning: AI test generation had issues, but continuing..."
+fi
+
+if [ -d "./tests/generated" ]; then
+  TEST_COUNT=$(find "./tests/generated" -name 'test_*.py' -type f | wc -l)
+  echo "Total AI-generated test files: $TEST_COUNT"
+else
+  echo "No tests generated!"
+  TEST_COUNT=0
+fi
+
+if [ "$TEST_COUNT" -gt 0 ]; then
+  find ./tests/generated -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+  echo ""
+  echo "Running pytest on AI-generated tests..."
+  AI_TEST_EXIT_CODE=0
+  if pytest "$CURRENT_DIR/tests/generated" \
+    --cov="$TARGET_DIR" \
+    --cov-config=pytest.ini \
+    --cov-report=term-missing \
+    --cov-report=xml \
+    --cov-report=html \
+    --cov-fail-under=0 \
+    --json-report \
+    --junitxml="$CURRENT_DIR/test-results.xml" \
+    --json-report-file="$CURRENT_DIR/.pytest_generated.json" \
+    -v; then
+    AI_TEST_EXIT_CODE=0
+    echo "All AI- generated tests are passed"
+  else
+    AI_TEST_EXIT_CODE=1
+    echo "Warning: AI-generated tests had failures"
+  fi
+
+  if [ $AI_TEST_EXIT_CODE -ne 0 ]; then
+     echo ""
+    echo "Some AI-generated tests failed"
+    echo "Starting auto-fix..."
+    echo ""
+
+    if ! python run_auto_fixer.py \
+      --test-dir "$CURRENT_DIR/tests/generated" \
+      --project-root "$TARGET_DIR" \
+      --max-iterations 3; then
+      echo "Warning: Auto-fixer had issues, but continuing..."
+    fi
+
+    echo ""
+    echo "Re-running tests after auto-fix..."
+    if ! pytest "$CURRENT_DIR/tests/generated" \
+      --cov="$TARGET_DIR" \
+      --cov-config=pytest.ini \
+      --cov-report=term-missing \
+      --cov-report=xml \
+      --cov-report=html \
+      --cov-fail-under=0 \
+      --json-report \
+      --junitxml="$CURRENT_DIR/test-results.xml" \
+      --json-report-file="$CURRENT_DIR/.pytest_generated.json" \
+      -v; then
+      echo "Warning: Re-run tests still have failures"
+    fi
+  fi
+
+  echo ""
+  echo "Final Coverage Analysis:"
+  if ! coverage report --show-missing; then
+    echo "Warning: Final coverage report had issues"
+  fi
+
+  if [ -f coverage.xml ]; then
+    if COVERAGE=$(python3 -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f'{float(root.attrib.get(\"line-rate\", 0)) * 100:.2f}')" 2>/dev/null); then
+      echo ""
+      echo "AI Test Coverage: $COVERAGE%"
+
+      if (( $(echo "$COVERAGE < $MIN_COVERAGE" | bc -l) )); then
+        echo "Coverage below ${MIN_COVERAGE}%"
+      else
+        echo "Quality Gate Passed: Coverage ${COVERAGE}%"
+      fi
+
+      # Copy AI-generated tests to target repository and commit
+      if [ -d "$CURRENT_DIR/tests/generated" ]; then
+        TARGET_TESTS_DIR="$TARGET_DIR/tests/generated"
+        echo ""
+        echo "Copying AI-generated tests to target repository: $TARGET_TESTS_DIR"
+        mkdir -p "$TARGET_TESTS_DIR"
+        rsync -av --exclude "__pycache__/" --exclude="*.pyc" "$CURRENT_DIR/tests/generated/" "$TARGET_TESTS_DIR/"
+        echo "AI-generated tests copied to target repository successfully"
+
+        # Commit to target repository if it's a git repo
+        if [ -d "$TARGET_DIR/.git" ]; then
+          echo ""
+          echo "Committing AI-generated tests to target repository..."
+          cd "$TARGET_DIR"
+
+          # Configure git user if not already set
+          if [ -z "$(git config user.email)" ]; then
+            git config user.email "${GIT_USER_EMAIL:-ci-bot@example.com}"
+            git config user.name "${GIT_USER_NAME:-CI Bot}"
+          fi
+
+          git add tests/generated/
+
+          if ! git diff --cached --quiet 2>/dev/null; then
+            git commit -m "chore: add AI-generated test cases
+
+Auto-generated test cases from pipeline run (no manual tests)
+Final coverage: ${COVERAGE}%"
+            echo "AI-generated tests committed to target repository"
+
+            # Push to remote if GIT_PUSH_TOKEN is provided
+            if [ -n "${GIT_PUSH_TOKEN:-}" ]; then
+              echo "Pushing changes to remote repository..."
+
+              # Get current branch
+              CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+              # Get remote URL
+              REMOTE_URL=$(git config --get remote.origin.url)
+
+              # Configure git to use token for authentication
+              if [[ "$REMOTE_URL" == https://* ]]; then
+                # HTTPS URL - use token authentication
+                git push https://${GIT_PUSH_TOKEN}@${REMOTE_URL#https://} "$CURRENT_BRANCH" 2>&1 || {
+                  echo "Warning: Failed to push to remote repository"
+                }
+              else
+                # SSH URL or other - try normal push
+                git push origin "$CURRENT_BRANCH" 2>&1 || {
+                  echo "Warning: Failed to push to remote repository"
+                }
+              fi
+
+              echo "Changes pushed to remote repository successfully"
+            else
+              echo "Skipping push: GIT_PUSH_TOKEN not provided (set GIT_PUSH_TOKEN environment variable to enable auto-push)"
+            fi
+          else
+            echo "No new AI tests to commit"
+          fi
+
+          cd "$CURRENT_DIR"
+        else
+          echo "Warning: Target directory is not a git repository, AI tests not committed"
+        fi
+      fi
+    else
+      echo "Error: Failed to parse coverage"
+    fi
+  fi
+
+  # Upload to SonarQube
+  if [ -n "${SONAR_HOST_URL:-}" ] && [ -n "${SONAR_TOKEN:-}" ]; then
+    echo ""
+    mkdir -p "$TARGET_DIR/tests/"
+    rsync -av --exclude "__pycache__/" --exclude="conftest.py" "$CURRENT_DIR/tests/generated/" "$TARGET_DIR/tests/generated/"
+    echo "Uploading results to SonarQube..."
+    if ! sonar-scanner \
+      -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+      -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+      -Dsonar.host.url="$SONAR_HOST_URL" \
+      -Dsonar.token="$SONAR_TOKEN" \
+      -Dproject.settings="$CURRENT_DIR/sonar-project.properties" \
+      -Dsonar.projectBaseDir="$TARGET_DIR" \
+      -Dsonar.sources="$TARGET_DIR" \
+      -Dsonar.tests="$TARGET_DIR/tests/generated/" \
+      -Dsonar.python.xunit.reportPath="$CURRENT_DIR/test-results.xml" \
+      -Dsonar.python.coverage.reportPaths="$CURRENT_DIR/coverage.xml"; then
+      echo "Warning: SonarQube upload failed"
+      exit 1
+    else
+      echo "SonarQube upload complete!"
+    fi
+  else
+    echo "SonarQube credentials not provided, skipping upload"
+  fi
+  echo ""
+  check_final_coverage
+else
+  echo "No AI-generated tests found. Pipeline cannot proceed."
+  exit 1
+fi

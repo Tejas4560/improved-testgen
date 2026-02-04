@@ -1,0 +1,165 @@
+name: AI Test Generation Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'Git repository URL to test (e.g., https://github.com/user/repo.git)'
+        required: true
+        type: string
+      repo_branch:
+        description: 'Branch to checkout (default: main)'
+        required: false
+        default: 'main'
+        type: string
+      min_coverage:
+        description: 'Minimum coverage threshold (default: 90)'
+        required: false
+        default: '90'
+        type: string
+      sonar_project_key:
+        description: 'SonarQube Project Key (default: extracted from repo)'
+        required: false
+        default: ''
+        type: string
+      sonar_project_name:
+        description: 'SonarQube Project Name (default: extracted from repo)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    
+    steps:
+      - name: Checkout Pipeline Code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      
+      - name: Clone Target Repository
+        run: |
+          echo "Cloning repository: ${{ inputs.repo_url }}"
+          cd ${{ github.workspace }}
+          git clone --branch ${{ inputs.repo_branch }} ${{ inputs.repo_url }} target_repo
+          echo "Repository cloned successfully"
+          echo ""
+          echo "Workspace structure:"
+          ls -la ${{ github.workspace }}
+          echo ""
+          echo "Target repo contents:"
+          ls -la ${{ github.workspace }}/target_repo
+      
+      - name: Install Dependencies
+        run: |
+          cd ${{ github.workspace }}
+          python -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          echo "Dependencies installed"
+      
+      - name: Install SonarQube Scanner
+        run: |
+          cd ${{ github.workspace }}
+          mkdir -p venv/sonar-scanner
+          cd venv/sonar-scanner
+          
+          # Download and install sonar-scanner
+          wget -q https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+          unzip -q sonar-scanner-cli-5.0.1.3006-linux.zip
+          mv sonar-scanner-5.0.1.3006-linux/* .
+          rm -rf sonar-scanner-cli-5.0.1.3006-linux.zip sonar-scanner-5.0.1.3006-linux
+          
+          chmod +x bin/sonar-scanner
+          echo "SonarQube Scanner installed"
+          ./bin/sonar-scanner --version
+      
+      - name: Run AI Test Generation Pipeline
+        env:
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          OLLAMA_HOST: ${{ secrets.OLLAMA_HOST }}
+          OLLAMA_EMBED_MODEL: ${{ secrets.OLLAMA_EMBED_MODEL }}
+          VECTOR_DIM: ${{ secrets.VECTOR_DIM }}
+          MIN_COVERAGE_THRESHOLD: ${{ inputs.min_coverage }}
+          SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
+          SONAR_PROJECT_NAME: ${{ inputs.sonar_project_name }}
+          GIT_PUSH_TOKEN: ${{ secrets.GIT_PUSH_TOKEN }}
+        run: |
+          cd ${{ github.workspace }}
+          source venv/bin/activate
+          bash ./pipeline_runner.sh
+      
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            ${{ github.workspace }}/coverage.xml
+            ${{ github.workspace }}/test-results.xml
+            ${{ github.workspace }}/htmlcov/
+            ${{ github.workspace }}/.pytest_*.json
+            ${{ github.workspace }}/auto_fixer_report.json
+            ${{ github.workspace }}/manual_test_result.json
+            ${{ github.workspace }}/coverage_gaps.json
+          if-no-files-found: warn
+      
+      - name: Upload Coverage Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            ${{ github.workspace }}/coverage.xml
+            ${{ github.workspace }}/htmlcov/
+            ${{ github.workspace }}/ast_full_analysis.json
+            ${{ github.workspace }}/ast_gap_analysis.json
+          if-no-files-found: warn
+      
+      - name: Generate Test Summary
+        if: always()
+        run: |
+          cd ${{ github.workspace }}
+          
+          echo "## Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f coverage.xml ]; then
+            COVERAGE=$(python3 -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f'{float(root.attrib.get(\"line-rate\", 0)) * 100:.2f}')" 2>/dev/null || echo "0")
+            echo "**Coverage:** ${COVERAGE}%" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f manual_test_result.json ]; then
+            echo "### Manual Tests" >> $GITHUB_STEP_SUMMARY
+            python3 -c "import json; data=json.load(open('manual_test_result.json')); print(f'- **Found:** {data[\"manual_tests_found\"]}')" >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+          fi
+          
+          if [ -d tests/generated ]; then
+            TEST_COUNT=$(find tests/generated -name 'test_*.py' -type f 2>/dev/null | wc -l)
+            echo "### AI Generated Tests" >> $GITHUB_STEP_SUMMARY
+            echo "- **Generated Test Files:** ${TEST_COUNT}" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f ast_full_analysis.json ] || [ -f ast_gap_analysis.json ]; then
+            echo "### AST Analysis" >> $GITHUB_STEP_SUMMARY
+            if [ -f ast_full_analysis.json ]; then
+              echo "- **Full Code AST:** \`ast_full_analysis.json\`" >> $GITHUB_STEP_SUMMARY
+            fi
+            if [ -f ast_gap_analysis.json ]; then
+              echo "- **Gap-Focused AST:** \`ast_gap_analysis.json\`" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "*Available in coverage-reports artifact*" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Pipeline completed!" >> $GITHUB_STEP_SUMMARY

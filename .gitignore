@@ -1,0 +1,141 @@
+# AI TestGen - Python Project .gitignore
+
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ============================================
+# Virtual Environments
+# ============================================
+venv/
+env/
+.venv/
+.env/
+ENV/
+env.bak/
+venv.bak/
+myvenv/
+myvenev/
+.myvenv
+
+# ============================================
+# Environment Variables
+# ============================================
+.env
+.env.local
+.env.*.local
+
+# ============================================
+# Testing & Coverage
+# ============================================
+.pytest_cache/
+.coverage
+.coveragec
+coverage.xml
+htmlcov/
+cov_html/
+.tox/
+.nox/
+*.cover
+*.log
+test-results.xml
+.hypothesis/
+pytest_cache/
+
+# Test databases
+*.db
+test.db
+
+# ============================================
+# IDE & Editors
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+.ipynb_checkpoints/
+
+# ============================================
+# Project Specific
+# ============================================
+
+# Logs directory (keep structure, ignore content)
+logs/*.log
+logs/*.txt
+logs/*.xml
+
+# Codebase index
+.codebase_index/
+
+# SonarQube
+.scannerwork/
+
+# Generated files
+src/all_generation.zip
+src/gen.zip
+
+# Debug files
+debug_prompts/
+debug_prompt.txt
+
+# Auto-generated documentation
+AUTO_FIXER_SUMMARY.md
+AUTO_FIX_README.md
+AUTO_FIX_TESTS_README.md
+CODE_FLOW_DIAGRAM.md
+DEMO_RESULTS.md
+PIPELINE_SUMMARY.md
+QUALITY_GATE_SUMMARY.md
+
+# Test generation artifacts
+manual_test_result.json
+coverage_gaps.json
+iteration_report.json
+auto_fixer_report.json
+.pytest_*.json
+pytest_report.json
+
+# ============================================
+# Distribution / Packaging
+# ============================================
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ============================================
+# Misc
+# ============================================
+*.bak
+*.tmp
+*.temp
+.cache/
+ci/
+
+# Keep directory structure
+!logs/.gitkeep
+!tests/.gitkeep
+!examples/.gitkeep
+!docs/.gitkeep
+!config/.gitkeep
