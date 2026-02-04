@@ -1,0 +1,699 @@
+name: AI Test Generation Pipeline V2
+
+# ============================================================================
+# AI Test Generation Pipeline - Callable from any repository
+# Features:
+#   - Auto-detect repo URL and branch
+#   - Coverage before/after comparison with delta
+#   - GitHub Pages deployment for coverage reports
+#   - Rich summary tables and structured outputs
+#   - Reusable workflow (workflow_call)
+# ============================================================================
+
+on:
+  # Manual trigger with inputs
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'Target repository URL (leave empty to auto-detect)'
+        required: false
+        default: ''
+        type: string
+      repo_branch:
+        description: 'Branch to test (leave empty to auto-detect)'
+        required: false
+        default: ''
+        type: string
+      min_coverage:
+        description: 'Minimum coverage threshold (%)'
+        required: false
+        default: '90'
+        type: string
+      delta_threshold:
+        description: 'Minimum coverage improvement required (pp)'
+        required: false
+        default: '0'
+        type: string
+      deploy_pages:
+        description: 'Deploy coverage report to GitHub Pages'
+        required: false
+        default: 'true'
+        type: boolean
+      sonar_project_key:
+        description: 'SonarQube Project Key (optional)'
+        required: false
+        default: ''
+        type: string
+
+  # Callable from other repositories
+  workflow_call:
+    inputs:
+      repo_url:
+        description: 'Target repository URL'
+        required: false
+        default: ''
+        type: string
+      repo_branch:
+        description: 'Branch to test'
+        required: false
+        default: ''
+        type: string
+      min_coverage:
+        description: 'Minimum coverage threshold (%)'
+        required: false
+        default: '90'
+        type: string
+      delta_threshold:
+        description: 'Minimum coverage improvement required (pp)'
+        required: false
+        default: '0'
+        type: string
+      deploy_pages:
+        description: 'Deploy coverage report to GitHub Pages'
+        required: false
+        default: true
+        type: boolean
+      sonar_project_key:
+        description: 'SonarQube Project Key'
+        required: false
+        default: ''
+        type: string
+
+    secrets:
+      AZURE_OPENAI_API_KEY:
+        required: true
+      AZURE_OPENAI_ENDPOINT:
+        required: true
+      AZURE_OPENAI_DEPLOYMENT:
+        required: true
+      AZURE_OPENAI_API_VERSION:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+      SONAR_TOKEN:
+        required: false
+      GIT_PUSH_TOKEN:
+        required: false
+
+    outputs:
+      coverage_before:
+        description: 'Coverage before AI test generation'
+        value: ${{ jobs.test-generation.outputs.coverage_before }}
+      coverage_after:
+        description: 'Coverage after AI test generation'
+        value: ${{ jobs.test-generation.outputs.coverage_after }}
+      coverage_delta:
+        description: 'Coverage improvement (percentage points)'
+        value: ${{ jobs.test-generation.outputs.coverage_delta }}
+      tests_generated:
+        description: 'Number of test files generated'
+        value: ${{ jobs.test-generation.outputs.tests_generated }}
+      tests_passed:
+        description: 'Number of tests passed'
+        value: ${{ jobs.test-generation.outputs.tests_passed }}
+      tests_failed:
+        description: 'Number of tests failed'
+        value: ${{ jobs.test-generation.outputs.tests_failed }}
+      pipeline_status:
+        description: 'Pipeline status (success/failed)'
+        value: ${{ jobs.test-generation.outputs.pipeline_status }}
+      coverage_report_url:
+        description: 'GitHub Pages URL for coverage report'
+        value: ${{ jobs.test-generation.outputs.coverage_report_url }}
+      threshold_passed:
+        description: 'Whether coverage threshold was met'
+        value: ${{ jobs.test-generation.outputs.threshold_passed }}
+      delta_passed:
+        description: 'Whether delta threshold was met'
+        value: ${{ jobs.test-generation.outputs.delta_passed }}
+
+  # Trigger on PRs to main
+  pull_request:
+    branches: [main, master]
+    types: [opened, synchronize, reopened]
+
+# ============================================================================
+# Environment Variables
+# ============================================================================
+env:
+  PYTHON_VERSION: '3.10'
+  PIPELINE_REPO: 'Tejas4560/Tech_Demo'
+  PIPELINE_BRANCH: 'T1'
+  # Timeout settings
+  GENERATION_TIMEOUT: 600
+  OPENAI_TIMEOUT: 120
+  OPENAI_REQUEST_TIMEOUT: 180
+
+# ============================================================================
+# Jobs
+# ============================================================================
+jobs:
+  test-generation:
+    name: AI Test Generation
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+      pull-requests: write
+
+    outputs:
+      coverage_before: ${{ steps.metrics.outputs.coverage_before }}
+      coverage_after: ${{ steps.metrics.outputs.coverage_after }}
+      coverage_delta: ${{ steps.metrics.outputs.coverage_delta }}
+      tests_generated: ${{ steps.metrics.outputs.tests_generated }}
+      tests_passed: ${{ steps.metrics.outputs.tests_passed }}
+      tests_failed: ${{ steps.metrics.outputs.tests_failed }}
+      pipeline_status: ${{ steps.metrics.outputs.pipeline_status }}
+      coverage_report_url: ${{ steps.deploy-pages.outputs.pages_url }}
+      threshold_passed: ${{ steps.metrics.outputs.threshold_passed }}
+      delta_passed: ${{ steps.metrics.outputs.delta_passed }}
+
+    steps:
+      # ========================================
+      # 1. SETUP
+      # ========================================
+      - name: Checkout Pipeline Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PIPELINE_REPO }}
+          ref: ${{ env.PIPELINE_BRANCH }}
+          path: pipeline
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      # ========================================
+      # 2. AUTO-DETECT REPOSITORY
+      # ========================================
+      - name: Detect Target Repository
+        id: detect-repo
+        run: |
+          echo "Detecting target repository..."
+
+          # Get repo URL (input > auto-detect)
+          REPO_URL="${{ inputs.repo_url }}"
+          if [ -z "$REPO_URL" ]; then
+            REPO_URL="https://github.com/${{ github.repository }}.git"
+            echo "Auto-detected repo: $REPO_URL"
+          fi
+
+          # Get branch (input > PR head > push ref > default)
+          REPO_BRANCH="${{ inputs.repo_branch }}"
+          if [ -z "$REPO_BRANCH" ]; then
+            if [ -n "${{ github.head_ref }}" ]; then
+              REPO_BRANCH="${{ github.head_ref }}"
+            elif [ -n "${{ github.ref_name }}" ]; then
+              REPO_BRANCH="${{ github.ref_name }}"
+            else
+              REPO_BRANCH=$(git ls-remote --symref "$REPO_URL" HEAD 2>/dev/null | grep 'ref:' | sed 's/.*refs\/heads\///' | sed 's/\t.*//' || echo "main")
+            fi
+            echo "Auto-detected branch: $REPO_BRANCH"
+          fi
+
+          # Extract repo name
+          REPO_NAME=$(echo "$REPO_URL" | sed 's/.*\///' | sed 's/\.git$//')
+
+          echo "repo_url=$REPO_URL" >> $GITHUB_OUTPUT
+          echo "repo_branch=$REPO_BRANCH" >> $GITHUB_OUTPUT
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+
+          echo "Target: $REPO_NAME @ $REPO_BRANCH"
+
+      - name: Clone Target Repository
+        run: |
+          echo "Cloning ${{ steps.detect-repo.outputs.repo_name }}..."
+          cd ${{ github.workspace }}/pipeline
+          git clone --branch "${{ steps.detect-repo.outputs.repo_branch }}" \
+                    --depth 1 \
+                    "${{ steps.detect-repo.outputs.repo_url }}" \
+                    target_repo
+
+          echo "Target repository structure:"
+          ls -la target_repo/
+
+          PY_COUNT=$(find target_repo -name "*.py" -type f | wc -l)
+          echo "Found $PY_COUNT Python files"
+
+      # ========================================
+      # 3. INSTALL DEPENDENCIES
+      # ========================================
+      - name: Install Pipeline Dependencies
+        run: |
+          cd ${{ github.workspace }}/pipeline
+          python -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+          pip install pytest pytest-cov pytest-json-report coverage
+
+      - name: Install Target Project Dependencies
+        run: |
+          cd ${{ github.workspace }}/pipeline
+          source venv/bin/activate
+
+          if [ -f target_repo/requirements.txt ]; then
+            echo "Installing target project dependencies..."
+            pip install -r target_repo/requirements.txt || true
+          fi
+
+          if [ -f target_repo/requirements-dev.txt ]; then
+            pip install -r target_repo/requirements-dev.txt || true
+          fi
+
+      # ========================================
+      # 4. MEASURE INITIAL COVERAGE (BEFORE)
+      # ========================================
+      - name: Measure Initial Coverage
+        id: coverage-before
+        run: |
+          cd ${{ github.workspace }}/pipeline
+          source venv/bin/activate
+
+          echo "Measuring initial coverage (manual tests)..."
+
+          COVERAGE_BEFORE="0"
+          MANUAL_TESTS_FOUND="false"
+
+          if find target_repo -name "test_*.py" -o -name "*_test.py" 2>/dev/null | head -1 | grep -q .; then
+            MANUAL_TESTS_FOUND="true"
+            echo "Found existing test files"
+
+            cd target_repo
+            PYTHONPATH=. python -m pytest \
+              --cov=. \
+              --cov-report=xml:coverage_before.xml \
+              --cov-report=term \
+              --ignore=venv --ignore=.venv \
+              -q 2>/dev/null || true
+
+            if [ -f coverage_before.xml ]; then
+              COVERAGE_BEFORE=$(python3 -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('coverage_before.xml')
+root = tree.getroot()
+rate = float(root.attrib.get('line-rate', 0))
+print(f'{rate * 100:.2f}')
+" 2>/dev/null || echo "0")
+
+              cp coverage_before.xml ${{ github.workspace }}/pipeline/
+            fi
+            cd ..
+          else
+            echo "No existing tests found"
+          fi
+
+          echo "coverage_before=$COVERAGE_BEFORE" >> $GITHUB_OUTPUT
+          echo "manual_tests_found=$MANUAL_TESTS_FOUND" >> $GITHUB_OUTPUT
+
+          echo "Initial coverage: ${COVERAGE_BEFORE}%"
+
+      # ========================================
+      # 5. RUN AI TEST GENERATION
+      # ========================================
+      - name: Run AI Test Generation Pipeline
+        id: run-pipeline
+        env:
+          TARGET_ROOT: ${{ github.workspace }}/pipeline/target_repo
+          PYTHONPATH: ${{ github.workspace }}/pipeline/target_repo
+          MIN_COVERAGE_THRESHOLD: ${{ inputs.min_coverage || '90' }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION || '2024-02-15-preview' }}
+          GENERATION_TIMEOUT: ${{ env.GENERATION_TIMEOUT }}
+          OPENAI_TIMEOUT: ${{ env.OPENAI_TIMEOUT }}
+          OPENAI_REQUEST_TIMEOUT: ${{ env.OPENAI_REQUEST_TIMEOUT }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
+          GIT_PUSH_TOKEN: ${{ secrets.GIT_PUSH_TOKEN }}
+        run: |
+          cd ${{ github.workspace }}/pipeline
+          source venv/bin/activate
+
+          echo "Starting AI Test Generation Pipeline..."
+          echo "   Target: ${{ steps.detect-repo.outputs.repo_name }}"
+          echo "   Branch: ${{ steps.detect-repo.outputs.repo_branch }}"
+          echo "   Min Coverage: ${{ inputs.min_coverage || '90' }}%"
+          echo "   Timeout: ${GENERATION_TIMEOUT}s"
+          echo ""
+
+          PIPELINE_EXIT_CODE=0
+          bash ./pipeline_runner.sh || PIPELINE_EXIT_CODE=$?
+
+          echo "pipeline_exit_code=$PIPELINE_EXIT_CODE" >> $GITHUB_OUTPUT
+
+          if [ $PIPELINE_EXIT_CODE -eq 0 ]; then
+            echo "Pipeline completed successfully"
+          else
+            echo "Pipeline completed with exit code: $PIPELINE_EXIT_CODE"
+          fi
+
+      # ========================================
+      # 6. EXTRACT METRICS
+      # ========================================
+      - name: Extract Pipeline Metrics
+        id: metrics
+        if: always()
+        run: |
+          cd ${{ github.workspace }}/pipeline
+
+          echo "Extracting pipeline metrics..."
+
+          COVERAGE_BEFORE="${{ steps.coverage-before.outputs.coverage_before }}"
+          [ -z "$COVERAGE_BEFORE" ] && COVERAGE_BEFORE="0"
+
+          COVERAGE_AFTER="0"
+          if [ -f coverage.xml ]; then
+            COVERAGE_AFTER=$(python3 -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('coverage.xml')
+root = tree.getroot()
+rate = float(root.attrib.get('line-rate', 0))
+print(f'{rate * 100:.2f}')
+" 2>/dev/null || echo "0")
+          fi
+
+          COVERAGE_DELTA=$(python3 -c "
+before = float('$COVERAGE_BEFORE')
+after = float('$COVERAGE_AFTER')
+delta = after - before
+print(f'{delta:+.2f}')
+" 2>/dev/null || echo "0")
+
+          TESTS_GENERATED=0
+          if [ -d tests/generated ]; then
+            TESTS_GENERATED=$(find tests/generated -name "test_*.py" -type f | wc -l)
+          fi
+
+          TESTS_PASSED="0"
+          TESTS_FAILED="0"
+          TESTS_TOTAL="0"
+
+          for json_file in .pytest_combined.json .pytest_generated.json .pytest_manual.json; do
+            if [ -f "$json_file" ]; then
+              TESTS_PASSED=$(python3 -c "import json; data = json.load(open('$json_file')); print(data.get('summary', {}).get('passed', 0))" 2>/dev/null || echo "0")
+              TESTS_FAILED=$(python3 -c "import json; data = json.load(open('$json_file')); print(data.get('summary', {}).get('failed', 0))" 2>/dev/null || echo "0")
+              TESTS_TOTAL=$(python3 -c "import json; data = json.load(open('$json_file')); print(data.get('summary', {}).get('total', 0))" 2>/dev/null || echo "0")
+              break
+            fi
+          done
+
+          MIN_COVERAGE="${{ inputs.min_coverage || '90' }}"
+          DELTA_THRESHOLD="${{ inputs.delta_threshold || '0' }}"
+
+          THRESHOLD_PASSED=$(python3 -c "print('true' if float('$COVERAGE_AFTER') >= float('$MIN_COVERAGE') else 'false')" 2>/dev/null || echo "false")
+          DELTA_PASSED=$(python3 -c "delta = float('$COVERAGE_AFTER') - float('$COVERAGE_BEFORE'); print('true' if delta >= float('$DELTA_THRESHOLD') else 'false')" 2>/dev/null || echo "true")
+
+          if [ "$THRESHOLD_PASSED" = "true" ]; then
+            PIPELINE_STATUS="success"
+          else
+            PIPELINE_STATUS="threshold_not_met"
+          fi
+
+          echo "coverage_before=$COVERAGE_BEFORE" >> $GITHUB_OUTPUT
+          echo "coverage_after=$COVERAGE_AFTER" >> $GITHUB_OUTPUT
+          echo "coverage_delta=$COVERAGE_DELTA" >> $GITHUB_OUTPUT
+          echo "tests_generated=$TESTS_GENERATED" >> $GITHUB_OUTPUT
+          echo "tests_passed=$TESTS_PASSED" >> $GITHUB_OUTPUT
+          echo "tests_failed=$TESTS_FAILED" >> $GITHUB_OUTPUT
+          echo "tests_total=$TESTS_TOTAL" >> $GITHUB_OUTPUT
+          echo "threshold_passed=$THRESHOLD_PASSED" >> $GITHUB_OUTPUT
+          echo "delta_passed=$DELTA_PASSED" >> $GITHUB_OUTPUT
+          echo "pipeline_status=$PIPELINE_STATUS" >> $GITHUB_OUTPUT
+          echo "manual_tests_found=${{ steps.coverage-before.outputs.manual_tests_found }}" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "========================================"
+          echo "         PIPELINE METRICS              "
+          echo "========================================"
+          echo " Coverage Before (Manual):     ${COVERAGE_BEFORE}%"
+          echo " Coverage After (AI + Manual): ${COVERAGE_AFTER}%"
+          echo " Coverage Delta:               ${COVERAGE_DELTA} pp"
+          echo "----------------------------------------"
+          echo " Tests Generated:              ${TESTS_GENERATED} files"
+          echo " Tests Passed:                 ${TESTS_PASSED}"
+          echo " Tests Failed:                 ${TESTS_FAILED}"
+          echo "----------------------------------------"
+          echo " Threshold (${MIN_COVERAGE}%):              $( [ "$THRESHOLD_PASSED" = "true" ] && echo "PASSED" || echo "FAILED" )"
+          echo " Delta Threshold (${DELTA_THRESHOLD} pp):         $( [ "$DELTA_PASSED" = "true" ] && echo "PASSED" || echo "FAILED" )"
+          echo "========================================"
+
+      # ========================================
+      # 7. UPLOAD ARTIFACTS
+      # ========================================
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_number }}
+          path: |
+            ${{ github.workspace }}/pipeline/coverage.xml
+            ${{ github.workspace }}/pipeline/coverage_before.xml
+            ${{ github.workspace }}/pipeline/test-results.xml
+            ${{ github.workspace }}/pipeline/.pytest_*.json
+            ${{ github.workspace }}/pipeline/auto_fixer_report.json
+            ${{ github.workspace }}/pipeline/coverage_gaps.json
+            ${{ github.workspace }}/pipeline/manual_test_result.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload Coverage Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ github.run_number }}
+          path: |
+            ${{ github.workspace }}/pipeline/htmlcov/
+            ${{ github.workspace }}/pipeline/ast_full_analysis.json
+            ${{ github.workspace }}/pipeline/ast_gap_analysis.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload Generated Tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-tests-${{ github.run_number }}
+          path: |
+            ${{ github.workspace }}/pipeline/tests/generated/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ========================================
+      # 8. DEPLOY TO GITHUB PAGES
+      # ========================================
+      - name: Deploy Coverage to GitHub Pages
+        id: deploy-pages
+        if: ${{ always() && (inputs.deploy_pages == true || inputs.deploy_pages == 'true' || github.event_name == 'workflow_dispatch') }}
+        run: |
+          cd ${{ github.workspace }}
+
+          if [ ! -d "pipeline/htmlcov" ] || [ -z "$(ls -A pipeline/htmlcov 2>/dev/null)" ]; then
+            echo "No coverage report to deploy"
+            exit 0
+          fi
+
+          echo "Deploying coverage report to GitHub Pages..."
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git clone --depth=1 --branch gh-pages \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            gh-pages-deploy 2>/dev/null || {
+            echo "Creating new gh-pages branch..."
+            mkdir gh-pages-deploy
+            cd gh-pages-deploy
+            git init
+            git checkout -b gh-pages
+            echo "# Coverage Reports" > README.md
+            touch .nojekyll
+            git add .
+            git commit -m "Initialize gh-pages"
+            cd ..
+          }
+
+          REPORT_DIR="coverage/run-${{ github.run_number }}"
+          mkdir -p "gh-pages-deploy/$REPORT_DIR"
+
+          cp -r pipeline/htmlcov/* "gh-pages-deploy/$REPORT_DIR/"
+
+          cat > gh-pages-deploy/coverage/index.html << 'INDEXEOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>Coverage Reports</title>
+            <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 40px; }
+              h1 { color: #333; }
+              .report-list { list-style: none; padding: 0; }
+              .report-list li { padding: 10px; margin: 5px 0; background: #f5f5f5; border-radius: 5px; }
+              .report-list a { color: #0366d6; text-decoration: none; }
+            </style>
+          </head>
+          <body>
+            <h1>Coverage Reports</h1>
+            <ul class="report-list">
+          INDEXEOF
+
+          for dir in gh-pages-deploy/coverage/run-*/; do
+            if [ -d "$dir" ]; then
+              run_name=$(basename "$dir")
+              echo "    <li><a href=\"$run_name/index.html\">$run_name</a></li>" >> gh-pages-deploy/coverage/index.html
+            fi
+          done
+
+          echo "    </ul></body></html>" >> gh-pages-deploy/coverage/index.html
+
+          touch gh-pages-deploy/.nojekyll
+
+          cd gh-pages-deploy
+          git add -A
+
+          if git diff --staged --quiet; then
+            echo "No changes to deploy"
+          else
+            git commit -m "Deploy coverage report for run #${{ github.run_number }}"
+            git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" 2>/dev/null || \
+              git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            git push origin gh-pages --force
+            echo "Coverage report deployed!"
+          fi
+
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          PAGES_URL="https://${REPO_OWNER}.github.io/${REPO_NAME}/coverage/run-${{ github.run_number }}/index.html"
+
+          echo "pages_url=$PAGES_URL" >> $GITHUB_OUTPUT
+          echo "Coverage report: $PAGES_URL"
+
+      # ========================================
+      # 9. GENERATE SUMMARY
+      # ========================================
+      - name: Generate Job Summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          # AI Test Generation Pipeline Results
+
+          ## Repository Info
+          | Property | Value |
+          |----------|-------|
+          | **Repository** | \`${{ steps.detect-repo.outputs.repo_name }}\` |
+          | **Branch** | \`${{ steps.detect-repo.outputs.repo_branch }}\` |
+          | **Run Number** | #${{ github.run_number }} |
+          | **Triggered By** | ${{ github.actor }} |
+
+          ---
+
+          ## Coverage Metrics
+
+          | Metric | Value | Status |
+          |--------|-------|--------|
+          | **Coverage Before** (Manual Tests) | ${{ steps.metrics.outputs.coverage_before }}% | ${{ steps.metrics.outputs.manual_tests_found == 'true' && 'Found' || 'None' }} |
+          | **Coverage After** (AI + Manual) | ${{ steps.metrics.outputs.coverage_after }}% | - |
+          | **Coverage Delta** | ${{ steps.metrics.outputs.coverage_delta }} pp | - |
+          | **Target Threshold** | ${{ inputs.min_coverage || '90' }}% | ${{ steps.metrics.outputs.threshold_passed == 'true' && 'PASSED' || 'FAILED' }} |
+          | **Delta Threshold** | ${{ inputs.delta_threshold || '0' }} pp | ${{ steps.metrics.outputs.delta_passed == 'true' && 'PASSED' || 'FAILED' }} |
+
+          ---
+
+          ## Test Results
+
+          | Metric | Value |
+          |--------|-------|
+          | **AI Generated Test Files** | ${{ steps.metrics.outputs.tests_generated }} |
+          | **Total Tests Run** | ${{ steps.metrics.outputs.tests_total }} |
+          | **Tests Passed** | ${{ steps.metrics.outputs.tests_passed }} |
+          | **Tests Failed** | ${{ steps.metrics.outputs.tests_failed }} |
+
+          ---
+
+          ## Coverage Report
+
+          [View Interactive Coverage Report](${{ steps.deploy-pages.outputs.pages_url }})
+
+          ---
+
+          ## Artifacts
+
+          | Artifact | Description |
+          |----------|-------------|
+          | \`test-results-${{ github.run_number }}\` | Coverage XML, pytest results |
+          | \`coverage-report-${{ github.run_number }}\` | HTML coverage report |
+          | \`generated-tests-${{ github.run_number }}\` | AI-generated test files |
+
+          ---
+
+          **Pipeline Status:** ${{ steps.metrics.outputs.threshold_passed == 'true' && 'SUCCESS' || 'THRESHOLD NOT MET' }}
+          EOF
+
+      # ========================================
+      # 10. PR COMMENT
+      # ========================================
+      - name: Comment on Pull Request
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: ai-testgen-v2
+          message: |
+            ## AI Test Generation Results
+
+            ### Coverage Summary
+            | Metric | Before | After | Delta |
+            |--------|--------|-------|-------|
+            | **Line Coverage** | ${{ steps.metrics.outputs.coverage_before }}% | ${{ steps.metrics.outputs.coverage_after }}% | ${{ steps.metrics.outputs.coverage_delta }} pp |
+
+            ### Thresholds
+            | Check | Required | Actual | Status |
+            |-------|----------|--------|--------|
+            | Coverage | >= ${{ inputs.min_coverage || '90' }}% | ${{ steps.metrics.outputs.coverage_after }}% | ${{ steps.metrics.outputs.threshold_passed == 'true' && 'PASSED' || 'FAILED' }} |
+            | Delta | >= ${{ inputs.delta_threshold || '0' }} pp | ${{ steps.metrics.outputs.coverage_delta }} pp | ${{ steps.metrics.outputs.delta_passed == 'true' && 'PASSED' || 'FAILED' }} |
+
+            ### Tests
+            - **Generated**: ${{ steps.metrics.outputs.tests_generated }} files
+            - **Passed**: ${{ steps.metrics.outputs.tests_passed }}
+            - **Failed**: ${{ steps.metrics.outputs.tests_failed }}
+
+            ### Links
+            - [Coverage Report](${{ steps.deploy-pages.outputs.pages_url }})
+            - [Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            ---
+            *Run #${{ github.run_number }} | [View Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*
+
+      # ========================================
+      # 11. FAIL IF THRESHOLDS NOT MET
+      # ========================================
+      - name: Check Thresholds
+        if: always()
+        run: |
+          THRESHOLD_PASSED="${{ steps.metrics.outputs.threshold_passed }}"
+          DELTA_PASSED="${{ steps.metrics.outputs.delta_passed }}"
+
+          if [ "$THRESHOLD_PASSED" != "true" ]; then
+            echo "Coverage threshold not met!"
+            echo "   Required: ${{ inputs.min_coverage || '90' }}%"
+            echo "   Actual:   ${{ steps.metrics.outputs.coverage_after }}%"
+            exit 1
+          fi
+
+          if [ "$DELTA_PASSED" != "true" ]; then
+            echo "Delta threshold not met!"
+            echo "   Required: >= ${{ inputs.delta_threshold || '0' }} pp improvement"
+            echo "   Actual:   ${{ steps.metrics.outputs.coverage_delta }} pp"
+            exit 1
+          fi
+
+          echo "All thresholds passed!"
