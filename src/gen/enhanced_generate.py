@@ -56,7 +56,8 @@ def _detect_framework(analysis: Dict[str, Any], target_root: pathlib.Path) -> st
     1. FastAPI (from fastapi import FastAPI, import fastapi)
     2. Flask (from flask import Flask, import flask)
     3. Django (from django..., import django)
-    4. Universal (fallback)
+    4. Python (plain Python - no web framework)
+    5. Universal (fallback for unknown)
     """
     # Check if framework is already in analysis
     if "framework" in analysis:
@@ -91,12 +92,16 @@ def _detect_framework(analysis: Dict[str, Any], target_root: pathlib.Path) -> st
         return "django"
 
     # Check files in target directory for more thorough detection
+    has_web_framework = False
+    has_python_files = False
     try:
         for py_file in target_root.glob("**/*.py"):
             if "venv" in str(py_file) or "site-packages" in str(py_file):
                 continue
             if "test" in str(py_file).lower():
                 continue  # Skip test files
+
+            has_python_files = True
             try:
                 content = py_file.read_text(encoding='utf-8', errors='ignore')
 
@@ -115,12 +120,172 @@ def _detect_framework(analysis: Dict[str, Any], target_root: pathlib.Path) -> st
                 # Django detection
                 if "from django" in content or "import django" in content:
                     return "django"
+
+                # Check for any web framework indicators
+                web_indicators = [
+                    "import flask", "import fastapi", "import django",
+                    "from flask", "from fastapi", "from django",
+                    "import tornado", "import aiohttp", "import bottle",
+                    "import pyramid", "import cherrypy", "import falcon"
+                ]
+                for indicator in web_indicators:
+                    if indicator in content.lower():
+                        has_web_framework = True
+                        break
             except Exception:
                 continue
     except Exception:
         pass
 
+    # PLAIN PYTHON DETECTION:
+    # If we have Python files but NO web framework indicators, it's plain Python
+    if has_python_files and not has_web_framework:
+        print("   Detected PLAIN PYTHON project (no web framework)")
+        return "python"
+
     return "universal"
+
+
+def _get_source_to_test_mapping(target_root: pathlib.Path, analysis: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Create a mapping from source files to test file names.
+
+    For plain Python projects: 1 test file per source file.
+    This prevents duplicate coverage and test explosion.
+
+    Example:
+        ecommerce.py -> test_unit_ecommerce.py
+        app.py -> test_unit_app.py
+    """
+    mapping = {}
+
+    try:
+        for py_file in target_root.glob("**/*.py"):
+            if "venv" in str(py_file) or "site-packages" in str(py_file):
+                continue
+            if "test" in str(py_file).lower():
+                continue
+            if py_file.name.startswith("_"):
+                continue  # Skip private modules
+
+            # Get relative path from target root
+            rel_path = py_file.relative_to(target_root)
+            source_stem = py_file.stem
+
+            # Create test file name
+            test_filename = f"test_unit_{source_stem}.py"
+
+            mapping[str(rel_path)] = test_filename
+    except Exception as e:
+        print(f"Warning: Error creating source-to-test mapping: {e}")
+
+    return mapping
+
+
+def _count_branches_in_function(func: Dict[str, Any]) -> int:
+    """
+    Count the number of branches in a function for branch-aware testing.
+
+    Branch detection heuristic:
+    - if/else: +1 branch per if
+    - try/except: +1 branch
+    - for/while with potential empty: +1 branch
+    - raise: +1 branch (exception path)
+    - boolean conditions in return: +1 branch
+
+    Returns minimum number of tests needed for branch coverage.
+    """
+    branches = 1  # Always have at least happy path
+
+    # Get function body or source if available
+    body = func.get("body", "") or func.get("source", "") or ""
+    body_lower = body.lower()
+
+    # Count if statements
+    if_count = body_lower.count("if ") + body_lower.count("elif ")
+    branches += if_count
+
+    # Count try/except blocks
+    try_count = body_lower.count("try:")
+    branches += try_count
+
+    # Count raise statements (exception paths)
+    raise_count = body_lower.count("raise ")
+    branches += raise_count
+
+    # Count for/while loops (empty vs non-empty)
+    loop_count = body_lower.count("for ") + body_lower.count("while ")
+    branches += loop_count
+
+    # Count early returns (multiple exit points)
+    return_count = body_lower.count("return ")
+    if return_count > 1:
+        branches += return_count - 1
+
+    return branches
+
+
+def _can_raise_exception(func: Dict[str, Any]) -> bool:
+    """
+    Check if a function can raise an exception.
+
+    Used to ensure we generate pytest.raises tests for functions that raise.
+    """
+    body = func.get("body", "") or func.get("source", "") or ""
+
+    # Direct raise statements
+    if "raise " in body:
+        return True
+
+    # Common exception-raising patterns
+    exception_patterns = [
+        "ValueError", "TypeError", "KeyError", "IndexError",
+        "RuntimeError", "AttributeError", "ZeroDivisionError",
+        "FileNotFoundError", "PermissionError", "Exception"
+    ]
+
+    for pattern in exception_patterns:
+        if pattern in body:
+            return True
+
+    return False
+
+
+def _estimate_branch_coverage(compact: Dict[str, Any]) -> Dict[str, int]:
+    """
+    Estimate total branches and calculate tests needed.
+
+    Returns dict with:
+    - total_branches: Total branches across all functions
+    - tests_needed: Estimated tests needed for coverage
+    - functions_with_raises: Count of functions that can raise
+    """
+    total_branches = 0
+    functions_with_raises = 0
+
+    for func in compact.get("functions", []):
+        total_branches += _count_branches_in_function(func)
+        if _can_raise_exception(func):
+            functions_with_raises += 1
+
+    for method in compact.get("methods", []):
+        total_branches += _count_branches_in_function(method)
+        if _can_raise_exception(method):
+            functions_with_raises += 1
+
+    # For classes, count branches in __init__ and other methods
+    for cls in compact.get("classes", []):
+        methods = cls.get("methods", [])
+        for method in methods:
+            total_branches += _count_branches_in_function(method)
+            if _can_raise_exception(method):
+                functions_with_raises += 1
+
+    return {
+        "total_branches": total_branches,
+        "tests_needed": total_branches,  # One test per branch
+        "functions_with_raises": functions_with_raises
+    }
 
 
 def _create_universal_conftest(outdir: pathlib.Path, target_root: pathlib.Path,
@@ -774,19 +939,36 @@ def generate_all(analysis: Dict[str, Any], outdir: str = "tests/generated",
     print(f"Project Structure: Universal compatibility")
     
     has_routes = bool(compact.get("routes"))
-    test_kinds = ["unit", "integ"]
-    if has_routes:
-        test_kinds.append("e2e")
-    
+
+    # PLAIN PYTHON: Only unit tests, no integration/e2e
+    if detected_framework == "python":
+        test_kinds = ["unit"]
+        print("   Plain Python detected: generating unit tests only (branch-aware)")
+    else:
+        test_kinds = ["unit", "integ"]
+        if has_routes:
+            test_kinds.append("e2e")
+
     compact_json = json.dumps(compact, separators=(",", ":"))
     generated_files = []
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    
+
+    # For plain Python: create source-to-test mapping
+    source_to_test_map = {}
+    if detected_framework == "python":
+        source_to_test_map = _get_source_to_test_mapping(target_root, analysis)
+        print(f"   Source-to-test mapping: {len(source_to_test_map)} source files")
+
+        # Estimate branch coverage
+        branch_estimate = _estimate_branch_coverage(compact)
+        print(f"   Branch analysis: {branch_estimate['total_branches']} branches, "
+              f"{branch_estimate['functions_with_raises']} functions can raise")
+
     for test_kind in test_kinds:
         num_files = files_per_kind(compact, test_kind, detected_framework)
         if num_files <= 0:
             continue
-        
+
         print(f"Generating {num_files} {test_kind.upper()} test files for {detected_framework.upper()}...")
 
         for file_index in range(num_files):

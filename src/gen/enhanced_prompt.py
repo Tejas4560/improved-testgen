@@ -40,6 +40,19 @@ SYSTEM_PROMPTS = {
         " - Check response.status_code and response.json()\n"
         " - Return ONLY Python code, no markdown\n"
     ),
+    "python": (
+        "Generate BRANCH-AWARE pytest test code for PLAIN PYTHON code.\n"
+        "PLAIN PYTHON REQUIREMENTS (CRITICAL FOR COVERAGE):\n"
+        " - Generate ONE TEST PER BRANCH, not just one test per function\n"
+        " - For each if/else: test BOTH branches (true and false conditions)\n"
+        " - For each try/except: test BOTH success AND exception paths\n"
+        " - For each raise: test with pytest.raises() to cover exception path\n"
+        " - For loops: test with empty AND non-empty iterables\n"
+        " - For validation functions: test valid AND invalid inputs\n"
+        " - Use REAL imports - NO MagicMock unless testing IO/network/time\n"
+        " - NEVER mock pure Python logic - execute it directly\n"
+        " - Return ONLY Python code, no markdown\n"
+    ),
     "universal": (
         "Generate comprehensive pytest test code that works with ANY Python project structure.\n"
         "UNIVERSAL TESTING REQUIREMENTS:\n"
@@ -52,6 +65,163 @@ SYSTEM_PROMPTS = {
         " - Be completely framework-agnostic and project-structure-agnostic\n"
     )
 }
+
+# ============================================================================
+# PLAIN PYTHON SPECIFIC CONSTANTS
+# ============================================================================
+
+# Branch-aware test generation rules for plain Python
+BRANCH_AWARE_RULES = """
+🎯 BRANCH-AWARE TEST GENERATION (CRITICAL FOR COVERAGE)
+
+Coverage failures in plain Python are BRANCH failures, not function failures.
+Generate tests for EACH BRANCH, not just each function.
+
+BRANCH DETECTION PATTERNS:
+┌─────────────────┬───────────────────────────────────────┬─────────────┐
+│ Code Pattern    │ What to Test                          │ Min Tests   │
+├─────────────────┼───────────────────────────────────────┼─────────────┤
+│ if/else         │ Both true AND false conditions        │ 2           │
+│ if/elif/else    │ Each branch + else                    │ 3+          │
+│ try/except      │ Success path + each except handler    │ 2+          │
+│ for/while       │ Empty iterable + non-empty iterable   │ 2           │
+│ raise           │ Use pytest.raises() to cover          │ 1           │
+│ return early    │ Each return path                      │ 2+          │
+│ bool condition  │ True case + False case                │ 2           │
+└─────────────────┴───────────────────────────────────────┴─────────────┘
+
+EXAMPLE - ARITHMETIC FUNCTION:
+```python
+def divide(a, b):
+    if b == 0:
+        raise ValueError("Cannot divide by zero")
+    return a / b
+```
+REQUIRED TESTS (minimum 2):
+```python
+def test_divide_success():
+    assert divide(10, 2) == 5.0
+
+def test_divide_by_zero():
+    with pytest.raises(ValueError):
+        divide(10, 0)
+```
+
+EXAMPLE - VALIDATION FUNCTION:
+```python
+def validate_email(email):
+    if not email:
+        return False
+    if "@" not in email:
+        return False
+    return True
+```
+REQUIRED TESTS (minimum 3):
+```python
+def test_validate_email_valid():
+    assert validate_email("test@example.com") is True
+
+def test_validate_email_empty():
+    assert validate_email("") is False
+    assert validate_email(None) is False
+
+def test_validate_email_no_at():
+    assert validate_email("invalid") is False
+```
+
+EXAMPLE - CLASS WITH CONDITIONAL LOGIC:
+```python
+class ShoppingCart:
+    def __init__(self):
+        self.items = []
+
+    def checkout(self):
+        if not self.items:
+            raise Exception("Cart is empty")
+        return sum(item.price for item in self.items)
+```
+REQUIRED TESTS (minimum 2):
+```python
+def test_checkout_with_items():
+    cart = ShoppingCart()
+    cart.items = [Item(price=10), Item(price=20)]
+    assert cart.checkout() == 30
+
+def test_checkout_empty_cart():
+    cart = ShoppingCart()
+    with pytest.raises(Exception):
+        cart.checkout()
+```
+"""
+
+# Anti-mocking rules for plain Python
+PLAIN_PYTHON_MOCKING_RULES = """
+🚫 MOCKING RULES FOR PLAIN PYTHON (CRITICAL)
+
+DO NOT MOCK unless the function involves:
+❌ Network I/O (requests, HTTP calls, APIs)
+❌ File system I/O (reading/writing files)
+❌ Database connections
+❌ Time-dependent operations (datetime.now(), time.sleep())
+❌ Random number generation (when determinism needed)
+❌ External services or third-party APIs
+
+ALWAYS EXECUTE DIRECTLY (no mocking):
+✅ Pure functions (input → output with no side effects)
+✅ Data validation functions
+✅ Mathematical calculations
+✅ String manipulations
+✅ List/dict operations
+✅ Class instantiation and method calls
+✅ Business logic without I/O
+
+WHY: Mocked code does NOT count for coverage!
+
+BAD (coverage killer):
+```python
+mock = MagicMock()
+mock.calculate.return_value = 42  # This line IS NOT TESTED!
+```
+
+GOOD (real coverage):
+```python
+result = calculator.calculate(10, 5)  # This line IS TESTED!
+assert result == 15
+```
+"""
+
+# Exception testing rules
+EXCEPTION_TEST_RULES = """
+⚠️ EXCEPTION TESTING IS MANDATORY (NOT OPTIONAL)
+
+If a function can raise an exception, you MUST test it:
+
+RULE: Use pytest.raises() for exception paths
+RULE: NEVER mix success and exception assertions in the same test
+
+CORRECT PATTERN:
+```python
+def test_function_success():
+    \"\"\"Test normal execution path.\"\"\"
+    result = my_function(valid_input)
+    assert result == expected_value
+
+def test_function_raises_on_invalid():
+    \"\"\"Test exception path.\"\"\"
+    with pytest.raises(ValueError):
+        my_function(invalid_input)
+```
+
+COMMON EXCEPTION TRIGGERS TO TEST:
+- Empty input: my_function("")
+- None input: my_function(None)
+- Zero division: divide(x, 0)
+- Index out of range: list[999]
+- Key not found: dict["missing_key"]
+- Type mismatch: int_function("string")
+- Negative values: price(-10)
+- Invalid format: parse_date("not-a-date")
+"""
 
 # Default for backward compatibility
 SYSTEM_MIN = SYSTEM_PROMPTS["universal"]
@@ -559,14 +729,24 @@ def targets_count(compact: Dict[str, Any], kind: str, framework: str = "universa
     """
     Count testable targets for a given test kind.
 
-    CRITICAL DIFFERENCE:
+    CRITICAL DIFFERENCE BY FRAMEWORK:
     - Flask: routes → integration tests ONLY
     - FastAPI: routes → unit OR integration tests (routes are unit-testable!)
+    - Python: ALL code → unit tests ONLY (no integration/e2e)
     """
     functions = compact.get("functions", [])
     classes = compact.get("classes", [])
     methods = compact.get("methods", [])
     routes = compact.get("routes", [])
+
+    # PLAIN PYTHON: Only unit tests, everything is testable
+    if framework == "python":
+        if kind == "unit":
+            # For plain Python, ALL functions/classes/methods are unit testable
+            return len(functions) + len(classes) + len(methods)
+        else:
+            # No integration or e2e tests for plain Python
+            return 0
 
     if kind == "unit":
         # Pure functions for unit tests
@@ -598,8 +778,35 @@ def files_per_kind(compact: Dict[str, Any], kind: str, framework: str = "univers
     CRITICAL: Framework affects what can be unit tested:
     - Flask: routes → integration only (no unit test for routes)
     - FastAPI: routes → unit testable (TestClient makes routes unit-testable)
+    - Python: ONLY unit tests, one file per source module
     """
     total_targets = targets_count(compact, kind, framework)
+
+    # PLAIN PYTHON: Only generate unit tests
+    if framework == "python":
+        if kind != "unit":
+            # No integration or e2e tests for plain Python
+            return 0
+        if total_targets == 0:
+            print("   ℹ️  No testable targets found")
+            return 0
+        # For plain Python: aim for one test file per source file
+        # Count unique source files
+        source_files = set()
+        for func in compact.get("functions", []):
+            source_file = func.get("file", "")
+            if source_file:
+                source_files.add(source_file)
+        for cls in compact.get("classes", []):
+            source_file = cls.get("file", "")
+            if source_file:
+                source_files.add(source_file)
+        for method in compact.get("methods", []):
+            source_file = method.get("file", "")
+            if source_file:
+                source_files.add(source_file)
+        # One test file per source file (or at least 1)
+        return max(1, len(source_files))
 
     # For unit tests: check based on framework
     if kind == "unit":
@@ -796,6 +1003,28 @@ def _get_framework_rules(framework: str) -> str:
             "- Check: response.status_code, response.json()\n"
             "- For async: use pytest-asyncio markers\n"
         )
+    elif framework == "python":
+        return (
+            "PLAIN PYTHON REQUIREMENTS (BRANCH-AWARE):\n"
+            "1) Generate ONE TEST PER BRANCH, not one test per function\n"
+            "2) Use REAL imports - execute actual code, no mocking unless I/O\n"
+            "3) Test BOTH branches of every if/else statement\n"
+            "4) Use pytest.raises() for EVERY function that can raise\n"
+            "5) Test with edge cases: None, empty, zero, negative, boundary values\n"
+            "6) @pytest.mark.parametrize for multiple input combinations\n"
+            "7) Only output runnable Python (no markdown)\n"
+            "\nPLAIN PYTHON RULES:\n"
+            "- NO MagicMock for pure functions - call them directly\n"
+            "- NO mocking of class instantiation - create real objects\n"
+            "- NO mocking of methods without I/O - execute them\n"
+            "- YES pytest.raises() for exception testing (mandatory)\n"
+            "- YES parametrize for testing multiple inputs\n"
+            "- YES edge case testing: None, '', 0, -1, [], {}\n"
+            "\nIMPORT VALIDATION:\n"
+            "- ONLY import modules that exist in the project\n"
+            "- VERIFY all symbols are defined before using\n"
+            "- If import fails, skip test with pytest.importorskip()\n"
+        )
     else:
         return base_rules
 
@@ -848,6 +1077,36 @@ def _get_anti_patterns(framework: str) -> str:
             "- Explicit HTTPException(400) → 400\n"
             "- Unhandled exception → 500\n"
         )
+    elif framework == "python":
+        # Plain Python - different anti-patterns focused on mocking
+        return (
+            "🚫 PLAIN PYTHON ANTI-PATTERNS (CRITICAL FOR COVERAGE):\n"
+            "\n"
+            "MOCKING ANTI-PATTERNS (COVERAGE KILLERS):\n"
+            "- NEVER use MagicMock for pure functions - execute them directly\n"
+            "- NEVER mock class instantiation - create real objects\n"
+            "- NEVER mock methods that have no I/O - call them directly\n"
+            "- NEVER use mock.return_value for testable logic\n"
+            "- Mocked code does NOT count for coverage!\n"
+            "\n"
+            "WHEN TO USE MOCKING (ONLY THESE CASES):\n"
+            "✅ Network calls (requests.get, urllib)\n"
+            "✅ File I/O (open, read, write)\n"
+            "✅ Database connections\n"
+            "✅ Time-dependent functions (datetime.now, time.sleep)\n"
+            "✅ External APIs and services\n"
+            "\n"
+            "TESTING ANTI-PATTERNS:\n"
+            "- NEVER write only happy-path tests - test ALL branches\n"
+            "- NEVER skip exception testing - use pytest.raises()\n"
+            "- NEVER test just one case for if/else - test BOTH branches\n"
+            "- NEVER assume single test per function is enough\n"
+            "\n"
+            "IMPORT ANTI-PATTERNS:\n"
+            "- NEVER import non-existent modules\n"
+            "- NEVER use undefined symbols\n"
+            "- ALWAYS verify imports resolve before generating tests\n"
+        )
     else:
         return universal_anti
 
@@ -855,8 +1114,56 @@ def _get_anti_patterns(framework: str) -> str:
 def _get_test_category_guidance(kind: str, framework: str) -> str:
     """Get specific guidance for each test category to prevent misclassification."""
     if kind == "unit":
+        # Plain Python - branch-aware unit tests
+        if framework == "python":
+            return f"""
+🎯 UNIT TEST SPECIFIC GUIDANCE (PLAIN PYTHON - BRANCH-AWARE):
+
+FOR THIS UNIT TEST FILE, YOU MUST:
+✅ Generate ONE TEST PER BRANCH, not one test per function
+✅ Test BOTH branches of every if/else
+✅ Test BOTH success AND exception paths for try/except
+✅ Test with empty AND non-empty inputs for loops
+✅ Use pytest.raises() for EVERY function that can raise
+✅ Execute REAL code - no mocking of pure logic
+✅ Test edge cases: None, empty string, zero, negative numbers
+
+BRANCH-AWARE TESTING PATTERN:
+```python
+# For a function with if/else:
+def test_function_when_condition_true():
+    result = my_function(valid_input)
+    assert result == expected_true_result
+
+def test_function_when_condition_false():
+    result = my_function(invalid_input)
+    assert result == expected_false_result
+
+# For a function that can raise:
+def test_function_success():
+    result = my_function(valid_input)
+    assert result == expected
+
+def test_function_raises():
+    with pytest.raises(ExpectedException):
+        my_function(invalid_input)
+```
+
+FOR THIS UNIT TEST FILE, YOU MUST NOT:
+❌ Mock pure Python functions - execute them directly
+❌ Write only happy-path tests - cover ALL branches
+❌ Skip exception testing - it's MANDATORY
+❌ Use MagicMock for testable logic
+❌ Import modules that don't exist
+
+{BRANCH_AWARE_RULES}
+
+{PLAIN_PYTHON_MOCKING_RULES}
+
+{EXCEPTION_TEST_RULES}
+"""
         # FastAPI routes ARE unit-testable - this is the key difference!
-        if framework == "fastapi":
+        elif framework == "fastapi":
             return """
 🎯 UNIT TEST SPECIFIC GUIDANCE (FASTAPI):
 
@@ -1044,6 +1351,81 @@ def test_auth_required(client):
     """Test endpoint that requires authentication."""
     response = client.get('/api/protected')
     assert response.status_code in (200, 401)  # Don't assume auth behavior
+'''
+    elif framework == "python":
+        return '''
+# Plain Python test template - BRANCH-AWARE for maximum coverage
+# NO MOCKING of pure logic - execute real code
+import pytest
+
+# ============== BRANCH-AWARE TEST EXAMPLES ==============
+
+# Example 1: Testing a function with if/else (test BOTH branches)
+def test_function_when_condition_true():
+    """Test the TRUE branch of conditional logic."""
+    # Call function with input that triggers TRUE branch
+    result = my_function(valid_input)
+    assert result == expected_true_result
+
+def test_function_when_condition_false():
+    """Test the FALSE branch of conditional logic."""
+    # Call function with input that triggers FALSE branch
+    result = my_function(invalid_input)
+    assert result == expected_false_result
+
+# Example 2: Testing exception paths (MANDATORY for functions that can raise)
+def test_function_success_path():
+    """Test normal execution - no exception."""
+    result = risky_function(valid_input)
+    assert result is not None
+
+def test_function_exception_path():
+    """Test exception path - use pytest.raises()."""
+    with pytest.raises(ValueError):
+        risky_function(invalid_input)
+
+# Example 3: Testing with edge cases
+@pytest.mark.parametrize("input_val,expected", [
+    ("valid", True),      # Normal case
+    ("", False),          # Empty string
+    (None, False),        # None value
+    ("  ", False),        # Whitespace only
+])
+def test_validation_multiple_cases(input_val, expected):
+    """Test validation with multiple edge cases."""
+    result = validate(input_val)
+    assert result == expected
+
+# Example 4: Testing loops (empty vs non-empty)
+def test_process_items_with_items():
+    """Test loop with non-empty list."""
+    items = [1, 2, 3]
+    result = process_items(items)
+    assert result == 6  # sum
+
+def test_process_items_empty():
+    """Test loop with empty list."""
+    result = process_items([])
+    assert result == 0
+
+# Example 5: Testing class methods (real instantiation, no mocking)
+class TestMyClass:
+    def test_init(self):
+        """Test class instantiation."""
+        obj = MyClass(param1, param2)
+        assert obj.attribute == expected_value
+
+    def test_method_success(self):
+        """Test method with valid input."""
+        obj = MyClass(param1, param2)
+        result = obj.method(valid_input)
+        assert result == expected
+
+    def test_method_raises(self):
+        """Test method exception path."""
+        obj = MyClass(param1, param2)
+        with pytest.raises(ExpectedException):
+            obj.method(invalid_input)
 '''
     else:
         return UNIVERSAL_SCAFFOLD

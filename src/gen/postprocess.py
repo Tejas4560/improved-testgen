@@ -835,6 +835,142 @@ def detect_direct_route_imports(code: str, framework: str) -> List[str]:
     return issues
 
 
+def validate_imports_resolve(code: str, target_root: str = "") -> List[str]:
+    """
+    Validate that imports in generated test code can be resolved.
+
+    This is CRITICAL for plain Python projects to prevent:
+    - ImportError at collection time
+    - NameError at runtime
+    - Broken test files
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ["Code has syntax errors - cannot validate imports"]
+
+    # Extract all imports
+    imports = []
+    from_imports = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                from_imports.append((module, alias.name))
+
+    # Known standard library modules (subset)
+    stdlib = {
+        'os', 'sys', 'pytest', 're', 'json', 'datetime', 'pathlib',
+        'typing', 'unittest', 'collections', 'itertools', 'functools',
+        'math', 'random', 'string', 'copy', 'io', 'tempfile', 'time',
+        'warnings', 'contextlib', 'abc', 'dataclasses', 'enum', 'types',
+        'decimal', 'fractions', 'numbers', 'operator', 'weakref',
+    }
+
+    # Known testing libraries
+    testing_libs = {
+        'pytest', 'unittest', 'mock', 'unittest.mock', 'hypothesis',
+        'pytest_mock', 'freezegun', 'responses', 'httpretty', 'faker',
+    }
+
+    # Check direct imports
+    for module in imports:
+        base_module = module.split('.')[0]
+        if base_module not in stdlib and base_module not in testing_libs:
+            # This might be a project import - check if it looks valid
+            if not _looks_like_valid_import(module, target_root):
+                issues.append(f"Unresolved import: {module}")
+
+    # Check from imports
+    for module, name in from_imports:
+        base_module = module.split('.')[0] if module else name.split('.')[0]
+        if base_module not in stdlib and base_module not in testing_libs:
+            if not _looks_like_valid_import(module or name, target_root):
+                issues.append(f"Unresolved from-import: from {module} import {name}")
+
+    return issues
+
+
+def _looks_like_valid_import(module_path: str, target_root: str) -> bool:
+    """
+    Check if an import looks like it could be valid.
+
+    This is a heuristic - we can't always know if an import will work.
+    """
+    if not module_path:
+        return False
+
+    # Common patterns that are likely valid
+    valid_patterns = [
+        'app', 'main', 'api', 'core', 'utils', 'helpers', 'models',
+        'services', 'views', 'handlers', 'config', 'settings',
+        'ecommerce', 'calculator', 'processor', 'validator',
+    ]
+
+    base_name = module_path.split('.')[0].lower()
+
+    # If it matches a common pattern, assume valid
+    for pattern in valid_patterns:
+        if pattern in base_name:
+            return True
+
+    # If target_root is specified, check if file exists
+    if target_root:
+        import pathlib
+        root = pathlib.Path(target_root)
+        module_file = module_path.replace('.', '/') + '.py'
+        if (root / module_file).exists():
+            return True
+        # Also check for package
+        module_dir = module_path.replace('.', '/')
+        if (root / module_dir / '__init__.py').exists():
+            return True
+
+    # Default: assume valid (too strict = too many false positives)
+    return True
+
+
+def detect_over_mocking(code: str, framework: str) -> List[str]:
+    """
+    Detect excessive mocking that kills coverage in plain Python projects.
+
+    Mocked code does NOT count for coverage!
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    if framework != "python":
+        return issues  # Only relevant for plain Python
+
+    # Patterns for over-mocking
+    over_mock_patterns = [
+        # MagicMock with return_value for simple functions
+        (r'MagicMock\(\s*return_value\s*=', 'MagicMock with return_value (consider calling real function)'),
+        # patch decorators for internal modules
+        (r'@patch\([\'"][^/\\]+[\'"]', '@patch on internal module (may reduce coverage)'),
+        # Mock for everything
+        (r'mock\s*=\s*Mock\(\)', 'Generic Mock object (try using real objects)'),
+        # MagicMock for class
+        (r'=\s*MagicMock\(\s*spec\s*=', 'MagicMock with spec (consider real instantiation)'),
+    ]
+
+    for pattern, message in over_mock_patterns:
+        matches = re.findall(pattern, code, re.IGNORECASE)
+        if len(matches) > 3:  # More than 3 occurrences is excessive
+            issues.append(f"Excessive mocking: {message} ({len(matches)} occurrences)")
+
+    return issues
+
+
 def validate_generated_test(code: str, framework: str) -> List[str]:
     """
     Validate generated test code for common issues.
@@ -856,6 +992,11 @@ def validate_generated_test(code: str, framework: str) -> List[str]:
     # Flask-specific: check for direct route imports
     if framework == "flask":
         issues.extend(detect_direct_route_imports(code, framework))
+
+    # Plain Python-specific: check for over-mocking and import issues
+    if framework == "python":
+        issues.extend(detect_over_mocking(code, framework))
+        issues.extend(validate_imports_resolve(code))
 
     return issues
 

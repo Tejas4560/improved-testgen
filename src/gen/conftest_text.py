@@ -9,7 +9,7 @@ def conftest_text(framework: str = "universal", target_root: str = "") -> str:
     Generate framework-specific conftest.py content.
 
     Args:
-        framework: One of "flask", "django", "fastapi", "universal"
+        framework: One of "flask", "django", "fastapi", "python", "universal"
         target_root: The target project root path (for sys.path setup)
 
     Returns:
@@ -23,6 +23,8 @@ def conftest_text(framework: str = "universal", target_root: str = "") -> str:
         return _django_conftest(target_root)
     elif framework == "fastapi":
         return _fastapi_conftest(target_root)
+    elif framework == "python":
+        return _plain_python_conftest(target_root)
     else:
         return _universal_conftest(target_root)
 
@@ -422,6 +424,95 @@ def reset_dependency_overrides(app):
     """Auto-reset dependency overrides after each test."""
     yield
     app.dependency_overrides.clear()
+'''
+
+
+def _plain_python_conftest(target_root: str = "") -> str:
+    """
+    Generate MINIMAL conftest for plain Python projects.
+
+    For plain Python projects, less is more:
+    - No web framework fixtures
+    - No client/app fixtures
+    - Just Python path setup and basic utilities
+    - Focus on branch coverage, not HTTP testing
+    """
+    return f'''"""
+Minimal pytest configuration for plain Python projects.
+BRANCH-AWARE testing - focus on code coverage, not HTTP.
+"""
+
+import os
+import sys
+import pytest
+
+# Suppress deprecation warnings during testing
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
+
+# Set testing environment
+os.environ.setdefault("TESTING", "true")
+
+# Add target project to Python path
+TARGET_ROOT = os.environ.get("TARGET_ROOT", "{target_root or ''}")
+if TARGET_ROOT and TARGET_ROOT not in sys.path:
+    sys.path.insert(0, TARGET_ROOT)
+
+# Also add current directory
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+
+# ============== MINIMAL PLAIN PYTHON FIXTURES ==============
+# For plain Python: less is more. Only add what's necessary.
+
+@pytest.fixture
+def sample_data():
+    """Sample test data for plain Python tests."""
+    return {{
+        "string": "test_value",
+        "number": 42,
+        "float": 3.14,
+        "boolean": True,
+        "list": [1, 2, 3],
+        "dict": {{"key": "value"}},
+        "none": None,
+        "empty_string": "",
+        "empty_list": [],
+        "empty_dict": {{}},
+        "zero": 0,
+        "negative": -1,
+    }}
+
+
+@pytest.fixture
+def edge_case_inputs():
+    """Edge case inputs for branch testing."""
+    return [
+        None,           # None input
+        "",             # Empty string
+        "   ",          # Whitespace only
+        [],             # Empty list
+        {{}},            # Empty dict
+        0,              # Zero
+        -1,             # Negative
+        0.0,            # Zero float
+        float("inf"),   # Infinity
+        float("-inf"),  # Negative infinity
+    ]
+
+
+# Markers for branch coverage tracking
+def pytest_configure(config):
+    """Register custom markers."""
+    config.addinivalue_line(
+        "markers", "branch_test: mark test as targeting specific branch"
+    )
+    config.addinivalue_line(
+        "markers", "exception_test: mark test as exception path test"
+    )
 '''
 
 
