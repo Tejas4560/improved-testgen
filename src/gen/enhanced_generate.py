@@ -46,13 +46,258 @@ except Exception as _e:
     
     def massage(code: str): return code
 
-def _create_universal_conftest(outdir: pathlib.Path, target_root: pathlib.Path) -> str:
-    """Create universal conftest.py for any project structure."""
+def _detect_framework(analysis: Dict[str, Any], target_root: pathlib.Path) -> str:
+    """
+    Detect the framework from analysis or by inspecting the target directory.
+
+    CRITICAL: Detect statically, do NOT import user code.
+
+    Detection priority:
+    1. FastAPI (from fastapi import FastAPI, import fastapi)
+    2. Flask (from flask import Flask, import flask)
+    3. Django (from django..., import django)
+    4. Python (plain Python - no web framework)
+    5. Universal (fallback for unknown)
+    """
+    # Check if framework is already in analysis
+    if "framework" in analysis:
+        return analysis["framework"].lower()
+
+    # Build imports text for exact matching
+    imports_text = ""
+    imports = analysis.get("imports", [])
+    for imp in imports:
+        if isinstance(imp, dict):
+            imports_text += f" {imp.get('module', '')} {imp.get('name', '')} "
+        elif isinstance(imp, str):
+            imports_text += f" {imp} "
+
+    imports_text = imports_text.lower()
+
+    # STATIC DETECTION - Do NOT import user code
+    # Check for FastAPI FIRST (more specific than Flask)
+    if "from fastapi import fastapi" in imports_text or "import fastapi" in imports_text:
+        return "fastapi"
+    if "from fastapi" in imports_text:
+        return "fastapi"
+
+    # Check for Flask
+    if "from flask import flask" in imports_text or "import flask" in imports_text:
+        return "flask"
+    if "from flask" in imports_text:
+        return "flask"
+
+    # Check for Django
+    if "from django" in imports_text or "import django" in imports_text:
+        return "django"
+
+    # Check files in target directory for more thorough detection
+    has_web_framework = False
+    has_python_files = False
+    try:
+        for py_file in target_root.glob("**/*.py"):
+            if "venv" in str(py_file) or "site-packages" in str(py_file):
+                continue
+            if "test" in str(py_file).lower():
+                continue  # Skip test files
+
+            has_python_files = True
+            try:
+                content = py_file.read_text(encoding='utf-8', errors='ignore')
+
+                # FastAPI detection (check first - more specific)
+                if "from fastapi import FastAPI" in content:
+                    return "fastapi"
+                if "import fastapi" in content:
+                    return "fastapi"
+
+                # Flask detection
+                if "from flask import Flask" in content:
+                    return "flask"
+                if "import flask" in content:
+                    return "flask"
+
+                # Django detection
+                if "from django" in content or "import django" in content:
+                    return "django"
+
+                # Check for any web framework indicators
+                web_indicators = [
+                    "import flask", "import fastapi", "import django",
+                    "from flask", "from fastapi", "from django",
+                    "import tornado", "import aiohttp", "import bottle",
+                    "import pyramid", "import cherrypy", "import falcon"
+                ]
+                for indicator in web_indicators:
+                    if indicator in content.lower():
+                        has_web_framework = True
+                        break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # PLAIN PYTHON DETECTION:
+    # If we have Python files but NO web framework indicators, it's plain Python
+    if has_python_files and not has_web_framework:
+        print("   Detected PLAIN PYTHON project (no web framework)")
+        return "python"
+
+    return "universal"
+
+
+def _get_source_to_test_mapping(target_root: pathlib.Path, analysis: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Create a mapping from source files to test file names.
+
+    For plain Python projects: 1 test file per source file.
+    This prevents duplicate coverage and test explosion.
+
+    Example:
+        ecommerce.py -> test_unit_ecommerce.py
+        app.py -> test_unit_app.py
+    """
+    mapping = {}
+
+    try:
+        for py_file in target_root.glob("**/*.py"):
+            if "venv" in str(py_file) or "site-packages" in str(py_file):
+                continue
+            if "test" in str(py_file).lower():
+                continue
+            if py_file.name.startswith("_"):
+                continue  # Skip private modules
+
+            # Get relative path from target root
+            rel_path = py_file.relative_to(target_root)
+            source_stem = py_file.stem
+
+            # Create test file name
+            test_filename = f"test_unit_{source_stem}.py"
+
+            mapping[str(rel_path)] = test_filename
+    except Exception as e:
+        print(f"Warning: Error creating source-to-test mapping: {e}")
+
+    return mapping
+
+
+def _count_branches_in_function(func: Dict[str, Any]) -> int:
+    """
+    Count the number of branches in a function for branch-aware testing.
+
+    Branch detection heuristic:
+    - if/else: +1 branch per if
+    - try/except: +1 branch
+    - for/while with potential empty: +1 branch
+    - raise: +1 branch (exception path)
+    - boolean conditions in return: +1 branch
+
+    Returns minimum number of tests needed for branch coverage.
+    """
+    branches = 1  # Always have at least happy path
+
+    # Get function body or source if available
+    body = func.get("body", "") or func.get("source", "") or ""
+    body_lower = body.lower()
+
+    # Count if statements
+    if_count = body_lower.count("if ") + body_lower.count("elif ")
+    branches += if_count
+
+    # Count try/except blocks
+    try_count = body_lower.count("try:")
+    branches += try_count
+
+    # Count raise statements (exception paths)
+    raise_count = body_lower.count("raise ")
+    branches += raise_count
+
+    # Count for/while loops (empty vs non-empty)
+    loop_count = body_lower.count("for ") + body_lower.count("while ")
+    branches += loop_count
+
+    # Count early returns (multiple exit points)
+    return_count = body_lower.count("return ")
+    if return_count > 1:
+        branches += return_count - 1
+
+    return branches
+
+
+def _can_raise_exception(func: Dict[str, Any]) -> bool:
+    """
+    Check if a function can raise an exception.
+
+    Used to ensure we generate pytest.raises tests for functions that raise.
+    """
+    body = func.get("body", "") or func.get("source", "") or ""
+
+    # Direct raise statements
+    if "raise " in body:
+        return True
+
+    # Common exception-raising patterns
+    exception_patterns = [
+        "ValueError", "TypeError", "KeyError", "IndexError",
+        "RuntimeError", "AttributeError", "ZeroDivisionError",
+        "FileNotFoundError", "PermissionError", "Exception"
+    ]
+
+    for pattern in exception_patterns:
+        if pattern in body:
+            return True
+
+    return False
+
+
+def _estimate_branch_coverage(compact: Dict[str, Any]) -> Dict[str, int]:
+    """
+    Estimate total branches and calculate tests needed.
+
+    Returns dict with:
+    - total_branches: Total branches across all functions
+    - tests_needed: Estimated tests needed for coverage
+    - functions_with_raises: Count of functions that can raise
+    """
+    total_branches = 0
+    functions_with_raises = 0
+
+    for func in compact.get("functions", []):
+        total_branches += _count_branches_in_function(func)
+        if _can_raise_exception(func):
+            functions_with_raises += 1
+
+    for method in compact.get("methods", []):
+        total_branches += _count_branches_in_function(method)
+        if _can_raise_exception(method):
+            functions_with_raises += 1
+
+    # For classes, count branches in __init__ and other methods
+    for cls in compact.get("classes", []):
+        methods = cls.get("methods", [])
+        for method in methods:
+            total_branches += _count_branches_in_function(method)
+            if _can_raise_exception(method):
+                functions_with_raises += 1
+
+    return {
+        "total_branches": total_branches,
+        "tests_needed": total_branches,  # One test per branch
+        "functions_with_raises": functions_with_raises
+    }
+
+
+def _create_universal_conftest(outdir: pathlib.Path, target_root: pathlib.Path,
+                                framework: str = "universal") -> str:
+    """Create framework-specific conftest.py."""
     from .conftest_text import conftest_text
     from .writer import write_text
-    
+
     conftest_path = outdir / "conftest.py"
-    base_conftest = conftest_text()
+
+    # Generate framework-specific conftest
+    base_conftest = conftest_text(framework=framework, target_root=str(target_root))
     
     # Enhanced universal conftest
     universal_conftest = base_conftest + f'''
@@ -586,14 +831,15 @@ def _sanitize_parametrize_signature_mismatches(code: str) -> str:
 
 def generate_all(analysis: Dict[str, Any], outdir: str = "tests/generated",
                 focus_files: Optional[List[str]] = None):
-    """Generate UNIVERSAL test suite for any project structure."""
+    """Generate framework-aware test suite for any project structure."""
     from .enhanced_analysis_utils import (compact_analysis, enhance_coverage_targeting,
-                                          filter_by_files, infer_required_packages, 
+                                          filter_by_files, infer_required_packages,
                                           pip_install, prune_unavailable_targets)
     from .enhanced_prompt import build_prompt, files_per_kind, focus_for
     from .writer import update_manifest, write_text
-    
-    print("UNIVERSAL test generation for ANY PROJECT STRUCTURE...")
+    from .postprocess import cleanup_generated_test, postprocess_all_tests
+
+    print("FRAMEWORK-AWARE test generation...")
     
     # Export full code AST (before any filtering)
     try:
@@ -631,13 +877,18 @@ def generate_all(analysis: Dict[str, Any], outdir: str = "tests/generated",
     target_root = pathlib.Path(os.environ.get("TARGET_ROOT", "target"))
     if not target_root.exists():
         raise RuntimeError(f"Target directory not found: {target_root}")
-    
-    # UNIVERSAL: Ensure target root is in Python path
+
+    # Ensure target root is in Python path
     if str(target_root) not in sys.path:
         sys.path.insert(0, str(target_root))
-    
-    conftest_path = _create_universal_conftest(output_dir, target_root)
-    print(f"Created universal conftest: {conftest_path}")
+
+    # DETECT FRAMEWORK for framework-aware generation
+    detected_framework = _detect_framework(analysis, target_root)
+    print(f"Detected framework: {detected_framework.upper()}")
+
+    # Create framework-specific conftest
+    conftest_path = _create_universal_conftest(output_dir, target_root, detected_framework)
+    print(f"Created {detected_framework} conftest: {conftest_path}")
     
     # Simple change detection - always generate tests
     changed_files = set()
@@ -688,45 +939,66 @@ def generate_all(analysis: Dict[str, Any], outdir: str = "tests/generated",
     print(f"Project Structure: Universal compatibility")
     
     has_routes = bool(compact.get("routes"))
-    test_kinds = ["unit", "integ"]
-    if has_routes:
-        test_kinds.append("e2e")
-    
+
+    # PLAIN PYTHON: Only unit tests, no integration/e2e
+    if detected_framework == "python":
+        test_kinds = ["unit"]
+        print("   Plain Python detected: generating unit tests only (branch-aware)")
+    else:
+        test_kinds = ["unit", "integ"]
+        if has_routes:
+            test_kinds.append("e2e")
+
     compact_json = json.dumps(compact, separators=(",", ":"))
     generated_files = []
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    
+
+    # For plain Python: create source-to-test mapping
+    source_to_test_map = {}
+    if detected_framework == "python":
+        source_to_test_map = _get_source_to_test_mapping(target_root, analysis)
+        print(f"   Source-to-test mapping: {len(source_to_test_map)} source files")
+
+        # Estimate branch coverage
+        branch_estimate = _estimate_branch_coverage(compact)
+        print(f"   Branch analysis: {branch_estimate['total_branches']} branches, "
+              f"{branch_estimate['functions_with_raises']} functions can raise")
+
     for test_kind in test_kinds:
-        num_files = files_per_kind(compact, test_kind)
+        num_files = files_per_kind(compact, test_kind, detected_framework)
         if num_files <= 0:
             continue
-        
-        print(f"Generating {num_files} {test_kind.upper()} test files for universal compatibility...")
-        
+
+        print(f"Generating {num_files} {test_kind.upper()} test files for {detected_framework.upper()}...")
+
         for file_index in range(num_files):
             try:
                 focus_label, focus_names, shard_targets = focus_for(compact, test_kind, file_index, num_files)
-                
+
                 if not focus_names:
                     continue
-                
+
                 print(f"Generating {test_kind} test {file_index + 1}/{num_files} for {len(focus_names)} targets")
-                
+
                 context = _gather_universal_context(target_root, filtered_analysis, focus_names)
-                
-                prompt_messages = build_prompt(test_kind, compact_json, focus_label, 
-                                              file_index, num_files, compact, context)
-                
+
+                # Pass detected framework to prompt builder
+                prompt_messages = build_prompt(test_kind, compact_json, focus_label,
+                                              file_index, num_files, compact, context,
+                                              framework=detected_framework)
+
                 test_code = _generate_with_universal_retry(prompt_messages, max_attempts=3)
-                
-                # UNIVERSAL: Fix imports for any project structure
+
+                # Fix imports for project structure
                 test_code = _fix_imports_for_universal_compatibility(test_code, target_root, analysis)
-                # NEW: sanitize parametrization mismatches automatically
+                # Sanitize parametrization mismatches
                 test_code = _sanitize_parametrize_signature_mismatches(test_code)
-                
+                # Clean up framework-specific issues (duplicate fixtures, wrong markers)
+                test_code = cleanup_generated_test(test_code, detected_framework)
+
                 filename = f"test_{test_kind}_{timestamp}_{file_index + 1:02d}.py"
                 file_path = output_dir / filename
-                
+
                 write_text(file_path, test_code)
                 generated_files.append(str(file_path))
                 print(f"  {filename} - {len(focus_names)} targets")
@@ -735,24 +1007,33 @@ def generate_all(analysis: Dict[str, Any], outdir: str = "tests/generated",
                 print(f"Error generating {test_kind} test {file_index + 1}: {e}")
                 traceback.print_exc()
     
+    # Final post-processing pass on all generated files
+    if generated_files:
+        print(f"\nPost-processing {len(generated_files)} generated test files...")
+        modified_count = postprocess_all_tests(output_dir, detected_framework)
+        if modified_count > 0:
+            print(f"  Post-processed {modified_count} files (removed duplicates/wrong markers)")
+
     change_summary = {
         "added_or_modified": len(changed_files),
         "deleted": len(deleted_files),
         "total_analyzed": len(changed_files) + len(deleted_files),
         "coverage_target": "Maximum",
-        "universal_compatibility": True,
+        "detected_framework": detected_framework,
         "project_structure": analysis.get("project_structure", {}).get("package_names", [])
     }
     from .writer import update_manifest  # re-import here to be safe
     update_manifest(output_dir, generated_files, change_summary)
-    
+
     if generated_files:
-        print(f"UNIVERSAL GENERATION COMPLETE: {len(generated_files)} test files")
-        print(f"Expected Coverage: Maximum with REAL IMPORTS")
-        print(f"Universal Compatibility: ENABLED")
-        print(f"Targets Covered: {total_targets}")
-        print(f"Project Structure: {len(analysis.get('project_structure', {}).get('package_names', []))} packages detected")
-    
+        print(f"\n{'='*50}")
+        print(f"GENERATION COMPLETE: {len(generated_files)} test files")
+        print(f"{'='*50}")
+        print(f"  Framework: {detected_framework.upper()}")
+        print(f"  Targets Covered: {total_targets}")
+        print(f"  Coverage Target: Maximum with REAL IMPORTS")
+        print(f"{'='*50}")
+
     return generated_files
 
 def _validate_and_fix_test_code(code: str, filename: str) -> str:

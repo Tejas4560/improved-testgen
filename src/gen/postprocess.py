@@ -438,10 +438,662 @@ def extract_python_only(text: str) -> str:
             return "\n\n".join(blocks)
         return text.replace("```","")
     return text
+
+
 def validate_code(code: str):
-        if not code.strip(): return False, "empty output"
-        if not re.search(r"def test_", code): return False, "no test functions"
-        try: ast.parse(code); return True, ""
-        except SyntaxError as e: return False, f"syntax error: {e}"
-    
+    if not code.strip(): return False, "empty output"
+    if not re.search(r"def test_", code): return False, "no test functions"
+    try: ast.parse(code); return True, ""
+    except SyntaxError as e: return False, f"syntax error: {e}"
+
+
 def massage(code: str): return code
+
+
+# ============== FIXTURE DEDUPLICATION ==============
+
+# Fixtures that should NOT be defined in test files (they're in conftest.py)
+CONFTEST_FIXTURES = {
+    'client', 'app', 'sample_data', 'auth_headers', 'user', 'admin_user',
+    'authenticated_client', 'rf', 'rf_with_session', 'mock_request',
+    'authenticated_user', 'event_loop', 'async_client', 'mock_db',
+    'reset_app_state', 'api_client', 'db'
+}
+
+
+def remove_duplicate_fixtures(code: str, framework: str = "universal") -> str:
+    """
+    Remove duplicate fixture definitions that exist in conftest.py.
+
+    Args:
+        code: The generated test code
+        framework: The detected framework
+
+    Returns:
+        Code with duplicate fixtures removed
+    """
+    lines = code.split('\n')
+    result_lines = []
+    skip_until_next_def = False
+    current_indent = 0
+    fixture_being_skipped = None
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Check if we're in skip mode
+        if skip_until_next_def:
+            # Check if this line starts a new top-level definition
+            stripped = line.strip()
+            if stripped and not line.startswith(' ') and not line.startswith('\t'):
+                # New top-level statement, stop skipping
+                skip_until_next_def = False
+                fixture_being_skipped = None
+            elif line.strip().startswith('@') and not line.startswith(' '):
+                # New decorator at top level, stop skipping
+                skip_until_next_def = False
+                fixture_being_skipped = None
+            else:
+                # Still inside the fixture being skipped
+                i += 1
+                continue
+
+        # Check if this is a fixture decorator followed by a function we should skip
+        if line.strip().startswith('@pytest.fixture'):
+            # Look ahead to find the function name
+            j = i + 1
+            while j < len(lines) and (lines[j].strip().startswith('@') or not lines[j].strip()):
+                j += 1
+
+            if j < len(lines):
+                func_match = re.match(r'def\s+(\w+)\s*\(', lines[j].strip())
+                if func_match:
+                    func_name = func_match.group(1)
+                    if func_name in CONFTEST_FIXTURES:
+                        # Skip this fixture - it's in conftest.py
+                        print(f"   Removing duplicate fixture: {func_name}")
+                        skip_until_next_def = True
+                        fixture_being_skipped = func_name
+                        i += 1
+                        continue
+
+        result_lines.append(line)
+        i += 1
+
+    return '\n'.join(result_lines)
+
+
+def remove_wrong_framework_markers(code: str, framework: str) -> str:
+    """
+    Remove markers/imports from wrong frameworks.
+
+    Args:
+        code: The generated test code
+        framework: The detected framework
+
+    Returns:
+        Code with wrong framework artifacts removed
+    """
+    if framework == "flask":
+        # Remove Django markers from Flask tests
+        code = re.sub(r'@pytest\.mark\.django_db(?:\([^)]*\))?\s*\n', '', code)
+        # Remove Django imports
+        code = re.sub(r'from django\.[^\n]+\n', '', code)
+        code = re.sub(r'import django[^\n]*\n', '', code)
+
+    elif framework == "fastapi":
+        # Remove Django markers from FastAPI tests
+        code = re.sub(r'@pytest\.mark\.django_db(?:\([^)]*\))?\s*\n', '', code)
+        # Remove Django imports
+        code = re.sub(r'from django\.[^\n]+\n', '', code)
+        code = re.sub(r'import django[^\n]*\n', '', code)
+        # Remove Flask imports
+        code = re.sub(r'from flask[^\n]+\n', '', code)
+        code = re.sub(r'import flask[^\n]*\n', '', code)
+
+    elif framework == "django":
+        # Remove Flask imports from Django tests
+        code = re.sub(r'from flask[^\n]+\n', '', code)
+        code = re.sub(r'import flask[^\n]*\n', '', code)
+        # Remove FastAPI imports
+        code = re.sub(r'from fastapi[^\n]+\n', '', code)
+        code = re.sub(r'import fastapi[^\n]*\n', '', code)
+
+    return code
+
+
+def fix_global_state_patterns(code: str) -> str:
+    """
+    Fix incorrect global state patterns in generated code.
+
+    Replaces patterns like:
+        global tasks
+        tasks = [...]
+
+    With correct patterns like:
+        from app import tasks
+        tasks.clear()
+        tasks.extend([...])
+    """
+    # Pattern: global varname followed by assignment
+    pattern = r'global\s+(\w+)\s*\n\s*\1\s*=\s*\[(.*?)\]'
+
+    def replace_global_pattern(match):
+        var_name = match.group(1)
+        # Return a comment explaining the issue
+        return f"# Note: Use {var_name}.clear() and {var_name}.extend([...]) instead of reassignment\n    # from app import {var_name}\n    # {var_name}.clear()"
+
+    code = re.sub(pattern, replace_global_pattern, code, flags=re.DOTALL)
+    return code
+
+
+def detect_fake_app_definitions(code: str, framework: str) -> List[str]:
+    """
+    Detect fake app definitions in test code.
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    # Patterns for fake app creation (should import real app instead)
+    fake_app_patterns = [
+        (r'app\s*=\s*Flask\s*\(\s*__name__\s*\)', 'Flask app created in test (should import real app)'),
+        (r'app\s*=\s*FastAPI\s*\(\s*\)', 'FastAPI app created in test (should import real app)'),
+        (r'application\s*=\s*Flask\s*\(\s*__name__\s*\)', 'Flask application created in test'),
+        (r'application\s*=\s*FastAPI\s*\(\s*\)', 'FastAPI application created in test'),
+        (r'@app\.route\s*\(', 'Route defined in test file (indicates fake app)'),
+        (r'@application\.route\s*\(', 'Route defined in test file (indicates fake app)'),
+        (r'@app\.get\s*\(', 'FastAPI route defined in test file'),
+        (r'@app\.post\s*\(', 'FastAPI route defined in test file'),
+    ]
+
+    for pattern, message in fake_app_patterns:
+        if re.search(pattern, code):
+            issues.append(message)
+
+    return issues
+
+
+def detect_html_assertions(code: str) -> List[str]:
+    """
+    Detect assertions on HTML content that shouldn't be tested.
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    # Patterns for HTML content assertions
+    html_patterns = [
+        (r"assert\s+['\"]<html", 'Assertion on HTML tag'),
+        (r"assert\s+['\"]<title", 'Assertion on title tag'),
+        (r"assert\s+['\"]<head", 'Assertion on head tag'),
+        (r"assert\s+['\"]<body", 'Assertion on body tag'),
+        (r"assert\s+['\"]<div", 'Assertion on div tag'),
+        (r"assert\s+['\"]<h1", 'Assertion on h1 tag'),
+        (r"assert\s+['\"]<!DOCTYPE", 'Assertion on DOCTYPE'),
+        (r"in\s+response.*['\"]<html", 'HTML check in response'),
+        (r"in\s+response.*['\"]<title", 'Title check in response'),
+        # Emoji assertions
+        (r"assert\s+['\"].*[\U0001F300-\U0001F9FF]", 'Assertion contains emoji'),
+        (r"in\s+response.*[\U0001F300-\U0001F9FF]", 'Response check contains emoji'),
+        # Common UI text that shouldn't be asserted
+        (r"assert\s+['\"].*Task Manager", 'Assertion on UI text'),
+        (r"assert\s+['\"].*Welcome to", 'Assertion on UI text'),
+    ]
+
+    for pattern, message in html_patterns:
+        if re.search(pattern, code, re.IGNORECASE):
+            issues.append(message)
+
+    return issues
+
+
+def remove_fake_app_definitions(code: str, framework: str) -> str:
+    """
+    Remove or comment out fake app definitions from test code.
+
+    This prevents tests from creating their own apps instead of importing the real one.
+    """
+    lines = code.split('\n')
+    result_lines = []
+    skip_mode = False
+    skip_indent = 0
+    route_block = False
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        current_indent = len(line) - len(line.lstrip())
+
+        # Detect fake app creation
+        if re.match(r'^\s*app\s*=\s*(Flask|FastAPI)\s*\(', line):
+            result_lines.append(f"# REMOVED: {stripped}  # Should import real app instead")
+            result_lines.append("# from app import app  # Use this instead")
+            i += 1
+            continue
+
+        # Detect route decorators (indicates fake app)
+        if re.match(r'^\s*@app\.(route|get|post|put|delete|patch)\s*\(', line):
+            route_block = True
+            skip_indent = current_indent
+            result_lines.append(f"# REMOVED FAKE ROUTE: {stripped}")
+            i += 1
+            continue
+
+        # Skip the function body after a route decorator
+        if route_block:
+            if stripped.startswith('def '):
+                # Start of function, continue skipping
+                result_lines.append(f"# REMOVED: {stripped}")
+                i += 1
+                continue
+            elif current_indent > skip_indent or not stripped:
+                # Still inside the function body
+                if stripped:
+                    result_lines.append(f"#     {stripped}")
+                i += 1
+                continue
+            else:
+                # Exited function body
+                route_block = False
+
+        result_lines.append(line)
+        i += 1
+
+    return '\n'.join(result_lines)
+
+
+def remove_html_assertions(code: str) -> str:
+    """
+    Remove or comment out HTML content assertions.
+
+    These assertions are fragile and test implementation details.
+    """
+    lines = code.split('\n')
+    result_lines = []
+
+    # Patterns to remove
+    html_assert_patterns = [
+        r"assert\s+['\"]<(?:html|title|head|body|div|h1|!DOCTYPE)",
+        r"assert\s+['\"][^'\"]*<(?:html|title|head|body|div|h1)",
+        r"in\s+response[^'\"]*['\"]<(?:html|title|head|body|div)",
+    ]
+
+    # Emoji patterns
+    emoji_pattern = r"[\U0001F300-\U0001F9FF\U00002702-\U000027B0\U0001F600-\U0001F64F]"
+
+    for line in lines:
+        stripped = line.strip()
+        should_comment = False
+
+        # Check for HTML assertions
+        for pattern in html_assert_patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                should_comment = True
+                break
+
+        # Check for emoji assertions
+        if not should_comment and 'assert' in line.lower():
+            if re.search(emoji_pattern, line):
+                should_comment = True
+
+        if should_comment:
+            indent = len(line) - len(line.lstrip())
+            result_lines.append(' ' * indent + f"# REMOVED HTML/EMOJI ASSERTION: {stripped}")
+            result_lines.append(' ' * indent + "pass  # Replace with status code assertion")
+        else:
+            result_lines.append(line)
+
+    return '\n'.join(result_lines)
+
+
+def detect_fastapi_wrong_error_codes(code: str) -> List[str]:
+    """
+    Detect if FastAPI tests incorrectly expect 400 for validation errors.
+
+    FastAPI uses 422 for Pydantic validation errors, NOT 400!
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    # Patterns that suggest wrong error code expectations
+    wrong_patterns = [
+        # Expecting 400 for empty/invalid JSON (should be 422)
+        (r'assert\s+.*status_code\s*==\s*400.*#.*valid', 'Expecting 400 for validation (should be 422 in FastAPI)'),
+        (r'assert\s+.*status_code\s*==\s*400.*#.*missing', 'Expecting 400 for missing field (should be 422 in FastAPI)'),
+        (r'assert\s+.*status_code\s*==\s*400.*#.*invalid', 'Expecting 400 for invalid data (should be 422 in FastAPI)'),
+        (r'assert\s+.*status_code\s*==\s*400.*#.*required', 'Expecting 400 for required field (should be 422 in FastAPI)'),
+        # JSON payload tests followed by 400 assertion
+        (r'json\s*=\s*\{\s*\}.*\n.*status_code\s*==\s*400', 'Empty JSON payload expects 400 (should be 422 in FastAPI)'),
+    ]
+
+    for pattern, message in wrong_patterns:
+        if re.search(pattern, code, re.IGNORECASE | re.MULTILINE):
+            issues.append(message)
+
+    return issues
+
+
+def fix_fastapi_error_codes(code: str) -> str:
+    """
+    Fix incorrect 400 status codes to 422 for FastAPI validation errors.
+
+    FastAPI uses 422 for Pydantic validation, not 400.
+    """
+    lines = code.split('\n')
+    result_lines = []
+
+    # Context tracking
+    in_validation_test = False
+
+    for i, line in enumerate(lines):
+        # Check if we're in a validation test function
+        if 'def test_' in line and any(word in line.lower() for word in ['valid', 'invalid', 'missing', 'required', 'error']):
+            in_validation_test = True
+        elif line.strip().startswith('def '):
+            in_validation_test = False
+
+        # Fix 400 → 422 for validation contexts
+        if in_validation_test and 'status_code' in line and '== 400' in line:
+            # Check context - is this a validation error test?
+            context_lines = '\n'.join(lines[max(0, i-5):i+1]).lower()
+            if any(word in context_lines for word in ['json={}', 'json = {}', 'missing', 'invalid', 'required', 'validation']):
+                line = line.replace('== 400', '== 422')
+                line = line.rstrip() + '  # FastAPI validation error\n' if not line.endswith('\n') else line.rstrip() + '  # FastAPI validation error'
+
+        result_lines.append(line)
+
+    return '\n'.join(result_lines)
+
+
+def detect_direct_route_imports(code: str, framework: str) -> List[str]:
+    """
+    Detect if tests import route functions directly (wrong for Flask).
+
+    Flask routes should be tested via test_client, not direct imports.
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    if framework != "flask":
+        return issues  # Only relevant for Flask
+
+    # Patterns for direct route imports
+    route_import_patterns = [
+        (r'from\s+app\s+import\s+.*(?:index|home|get_|post_|create_|update_|delete_)', 'Direct route import (use client instead)'),
+        (r'from\s+\w+\s+import\s+.*@app\.route', 'Direct import of route handler'),
+    ]
+
+    for pattern, message in route_import_patterns:
+        if re.search(pattern, code, re.IGNORECASE):
+            issues.append(message)
+
+    return issues
+
+
+def validate_imports_resolve(code: str, target_root: str = "") -> List[str]:
+    """
+    Validate that imports in generated test code can be resolved.
+
+    This is CRITICAL for plain Python projects to prevent:
+    - ImportError at collection time
+    - NameError at runtime
+    - Broken test files
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ["Code has syntax errors - cannot validate imports"]
+
+    # Extract all imports
+    imports = []
+    from_imports = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                from_imports.append((module, alias.name))
+
+    # Known standard library modules (subset)
+    stdlib = {
+        'os', 'sys', 'pytest', 're', 'json', 'datetime', 'pathlib',
+        'typing', 'unittest', 'collections', 'itertools', 'functools',
+        'math', 'random', 'string', 'copy', 'io', 'tempfile', 'time',
+        'warnings', 'contextlib', 'abc', 'dataclasses', 'enum', 'types',
+        'decimal', 'fractions', 'numbers', 'operator', 'weakref',
+    }
+
+    # Known testing libraries
+    testing_libs = {
+        'pytest', 'unittest', 'mock', 'unittest.mock', 'hypothesis',
+        'pytest_mock', 'freezegun', 'responses', 'httpretty', 'faker',
+    }
+
+    # Check direct imports
+    for module in imports:
+        base_module = module.split('.')[0]
+        if base_module not in stdlib and base_module not in testing_libs:
+            # This might be a project import - check if it looks valid
+            if not _looks_like_valid_import(module, target_root):
+                issues.append(f"Unresolved import: {module}")
+
+    # Check from imports
+    for module, name in from_imports:
+        base_module = module.split('.')[0] if module else name.split('.')[0]
+        if base_module not in stdlib and base_module not in testing_libs:
+            if not _looks_like_valid_import(module or name, target_root):
+                issues.append(f"Unresolved from-import: from {module} import {name}")
+
+    return issues
+
+
+def _looks_like_valid_import(module_path: str, target_root: str) -> bool:
+    """
+    Check if an import looks like it could be valid.
+
+    This is a heuristic - we can't always know if an import will work.
+    """
+    if not module_path:
+        return False
+
+    # Common patterns that are likely valid
+    valid_patterns = [
+        'app', 'main', 'api', 'core', 'utils', 'helpers', 'models',
+        'services', 'views', 'handlers', 'config', 'settings',
+        'ecommerce', 'calculator', 'processor', 'validator',
+    ]
+
+    base_name = module_path.split('.')[0].lower()
+
+    # If it matches a common pattern, assume valid
+    for pattern in valid_patterns:
+        if pattern in base_name:
+            return True
+
+    # If target_root is specified, check if file exists
+    if target_root:
+        import pathlib
+        root = pathlib.Path(target_root)
+        module_file = module_path.replace('.', '/') + '.py'
+        if (root / module_file).exists():
+            return True
+        # Also check for package
+        module_dir = module_path.replace('.', '/')
+        if (root / module_dir / '__init__.py').exists():
+            return True
+
+    # Default: assume valid (too strict = too many false positives)
+    return True
+
+
+def detect_over_mocking(code: str, framework: str) -> List[str]:
+    """
+    Detect excessive mocking that kills coverage in plain Python projects.
+
+    Mocked code does NOT count for coverage!
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    if framework != "python":
+        return issues  # Only relevant for plain Python
+
+    # Patterns for over-mocking
+    over_mock_patterns = [
+        # MagicMock with return_value for simple functions
+        (r'MagicMock\(\s*return_value\s*=', 'MagicMock with return_value (consider calling real function)'),
+        # patch decorators for internal modules
+        (r'@patch\([\'"][^/\\]+[\'"]', '@patch on internal module (may reduce coverage)'),
+        # Mock for everything
+        (r'mock\s*=\s*Mock\(\)', 'Generic Mock object (try using real objects)'),
+        # MagicMock for class
+        (r'=\s*MagicMock\(\s*spec\s*=', 'MagicMock with spec (consider real instantiation)'),
+    ]
+
+    for pattern, message in over_mock_patterns:
+        matches = re.findall(pattern, code, re.IGNORECASE)
+        if len(matches) > 3:  # More than 3 occurrences is excessive
+            issues.append(f"Excessive mocking: {message} ({len(matches)} occurrences)")
+
+    return issues
+
+
+def validate_generated_test(code: str, framework: str) -> List[str]:
+    """
+    Validate generated test code for common issues.
+
+    Returns list of validation errors/warnings.
+    """
+    issues = []
+
+    # Check for fake app definitions
+    issues.extend(detect_fake_app_definitions(code, framework))
+
+    # Check for HTML assertions
+    issues.extend(detect_html_assertions(code))
+
+    # FastAPI-specific: check for wrong error codes
+    if framework == "fastapi":
+        issues.extend(detect_fastapi_wrong_error_codes(code))
+
+    # Flask-specific: check for direct route imports
+    if framework == "flask":
+        issues.extend(detect_direct_route_imports(code, framework))
+
+    # Plain Python-specific: check for over-mocking and import issues
+    if framework == "python":
+        issues.extend(detect_over_mocking(code, framework))
+        issues.extend(validate_imports_resolve(code))
+
+    return issues
+
+
+def cleanup_generated_test(code: str, framework: str = "universal") -> str:
+    """
+    Apply all cleanup operations to generated test code.
+
+    Args:
+        code: The generated test code
+        framework: The detected framework
+
+    Returns:
+        Cleaned up code
+    """
+    # Validate and log all issues first
+    all_issues = validate_generated_test(code, framework)
+    if all_issues:
+        print(f"   ⚠️  Validation issues found: {all_issues}")
+
+    # Detect and log issues first
+    fake_app_issues = detect_fake_app_definitions(code, framework)
+    html_issues = detect_html_assertions(code)
+
+    if fake_app_issues:
+        print(f"   ⚠️  Detected fake app issues: {fake_app_issues}")
+    if html_issues:
+        print(f"   ⚠️  Detected HTML assertion issues: {html_issues}")
+
+    # Remove fake app definitions (CRITICAL - prevents fake apps)
+    code = remove_fake_app_definitions(code, framework)
+
+    # Remove HTML content assertions (prevents fragile tests)
+    code = remove_html_assertions(code)
+
+    # Remove duplicate fixtures
+    code = remove_duplicate_fixtures(code, framework)
+
+    # Remove wrong framework markers
+    code = remove_wrong_framework_markers(code, framework)
+
+    # Fix global state patterns
+    code = fix_global_state_patterns(code)
+
+    # FastAPI-specific: fix 400 → 422 for validation errors
+    if framework == "fastapi":
+        code = fix_fastapi_error_codes(code)
+
+    # Remove excessive blank lines
+    code = re.sub(r'\n{4,}', '\n\n\n', code)
+
+    # Remove any remaining markdown artifacts
+    code = re.sub(r'^```python\s*\n', '', code)
+    code = re.sub(r'^```\s*\n', '', code)
+    code = re.sub(r'\n```\s*$', '', code)
+
+    return code
+
+
+def postprocess_test_file(file_path: pathlib.Path, framework: str = "universal") -> bool:
+    """
+    Post-process a generated test file to clean up issues.
+
+    Args:
+        file_path: Path to the test file
+        framework: The detected framework
+
+    Returns:
+        True if file was modified, False otherwise
+    """
+    try:
+        original_content = file_path.read_text(encoding='utf-8')
+        cleaned_content = cleanup_generated_test(original_content, framework)
+
+        if cleaned_content != original_content:
+            file_path.write_text(cleaned_content, encoding='utf-8')
+            print(f"   Post-processed: {file_path.name}")
+            return True
+        return False
+    except Exception as e:
+        print(f"   Error post-processing {file_path}: {e}")
+        return False
+
+
+def postprocess_all_tests(output_dir: pathlib.Path, framework: str = "universal") -> int:
+    """
+    Post-process all generated test files in a directory.
+
+    Args:
+        output_dir: Directory containing generated tests
+        framework: The detected framework
+
+    Returns:
+        Number of files modified
+    """
+    modified_count = 0
+    for test_file in output_dir.glob("test_*.py"):
+        if postprocess_test_file(test_file, framework):
+            modified_count += 1
+    return modified_count
