@@ -199,7 +199,8 @@ jobs:
         run: |
           echo "Cloning ${{ steps.detect-repo.outputs.repo_name }}..."
           cd ${{ github.workspace }}/pipeline
-          git clone --branch "${{ steps.detect-repo.outputs.repo_branch }}" --depth 1 "${{ steps.detect-repo.outputs.repo_url }}" target_repo
+          # Full clone (not shallow) to match v1 behavior
+          git clone --branch "${{ steps.detect-repo.outputs.repo_branch }}" "${{ steps.detect-repo.outputs.repo_url }}" target_repo
           echo "Target repository structure:"
           ls -la target_repo/
           PY_COUNT=$(find target_repo -name "*.py" -type f | wc -l)
@@ -220,12 +221,11 @@ jobs:
         run: |
           cd ${{ github.workspace }}/pipeline
           source venv/bin/activate
+          # Skip this step - let pipeline_runner.sh handle dependency installation
+          # This avoids double-installation issues and ensures consistent behavior with v1
+          echo "Skipping pre-installation (handled by pipeline_runner.sh)"
           if [ -f target_repo/requirements.txt ]; then
-            echo "Installing target project dependencies..."
-            pip install -r target_repo/requirements.txt || true
-          fi
-          if [ -f target_repo/requirements-dev.txt ]; then
-            pip install -r target_repo/requirements-dev.txt || true
+            echo "Target project has requirements.txt - will be installed by pipeline"
           fi
 
       - name: Measure Initial Coverage
