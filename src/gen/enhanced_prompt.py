@@ -57,6 +57,13 @@ SYSTEM_PROMPTS = {
 SYSTEM_MIN = SYSTEM_PROMPTS["universal"]
 
 # ============================================================================
+# FASTAPI-SPECIFIC CONSTANTS
+# ============================================================================
+
+# FastAPI route decorators for detection
+FASTAPI_ROUTE_DECORATORS = {"get", "post", "put", "delete", "patch", "options", "head", "trace"}
+
+# ============================================================================
 # STRICT TEST GENERATION RULES (NON-NEGOTIABLE)
 # ============================================================================
 
@@ -94,14 +101,16 @@ UNIT TESTS (test_unit_*.py):
    ✅ Data validation functions
    ✅ Helper methods
    ✅ Class methods that don't require HTTP
-   ❌ NOT routes/endpoints (those are integration tests)
-   ❌ NOT Flask/Django/FastAPI views
+   ✅ FastAPI routes (TestClient makes them unit-testable!)
+   ❌ Flask routes (those require integration tests)
+   ❌ Django views (those require integration tests)
 
 INTEGRATION TESTS (test_integ_*.py):
    ✅ API endpoints via test client
    ✅ Database operations
    ✅ Service interactions
    ✅ Real HTTP request/response cycles
+   ✅ Flask routes (must use test_client())
    ❌ NOT creating fake apps - use REAL app
 
 END-TO-END TESTS (test_e2e_*.py):
@@ -112,7 +121,10 @@ END-TO-END TESTS (test_e2e_*.py):
    ❌ NOT HTML/UI assertions
    ❌ NOT creating fake apps
 
-CRITICAL: Routes are INTEGRATION tests, not unit tests!
+⚠️ FRAMEWORK-SPECIFIC:
+   - Flask routes → INTEGRATION tests only
+   - FastAPI routes → Can be UNIT tested (TestClient)
+   - Django views → INTEGRATION tests with @pytest.mark.django_db
 """
 
 NEVER_DO_RULES = """
@@ -144,6 +156,40 @@ NEVER_DO_RULES = """
 6. NEVER USE WRONG FRAMEWORK MARKERS:
    ❌ @pytest.mark.django_db  # WRONG for Flask/FastAPI
    ✅ Use markers matching detected framework only
+"""
+
+# FastAPI-specific error handling rules
+FASTAPI_ERROR_RULES = """
+⚠️ FASTAPI VALIDATION ERRORS - CRITICAL DIFFERENCE
+
+FastAPI uses Pydantic for automatic validation. This means:
+
+VALIDATION ERRORS → 422 (NOT 400!)
+   ❌ assert response.status_code == 400  # WRONG for FastAPI
+   ✅ assert response.status_code == 422  # CORRECT for FastAPI validation
+
+ERROR STATUS CODES IN FASTAPI:
+   - Missing required field → 422 Unprocessable Entity
+   - Wrong type (string instead of int) → 422 Unprocessable Entity
+   - Validation constraint failed → 422 Unprocessable Entity
+   - Route not found → 404 Not Found
+   - Unhandled exception → 500 Internal Server Error
+   - Manual HTTPException(400) → 400 Bad Request (only if explicit)
+
+EXAMPLE FASTAPI VALIDATION TEST:
+```python
+def test_create_item_validation(client):
+    # Missing required field - FastAPI returns 422, NOT 400
+    res = client.post("/items", json={})
+    assert res.status_code == 422  # Pydantic validation error
+
+def test_create_item_wrong_type(client):
+    # Wrong type - FastAPI returns 422
+    res = client.post("/items", json={"price": "not_a_number"})
+    assert res.status_code == 422
+```
+
+DO NOT use Flask error patterns in FastAPI tests!
 """
 
 # Universal test templates for any project
@@ -307,12 +353,85 @@ def parametrized_test_cases():
     ]
 '''
 
+def is_fastapi_route(func: Dict[str, Any]) -> bool:
+    """
+    Detect if a function is a FastAPI route handler via decorators.
+
+    FastAPI routes are identified by decorators like:
+    - @app.get("/path")
+    - @app.post("/path")
+    - @router.get("/path")
+    - @router.post("/path")
+
+    Returns:
+        True if the function is a FastAPI route handler
+    """
+    decorators = func.get("decorators", [])
+    for dec in decorators:
+        dec_str = str(dec).lower()
+        # Check for FastAPI-style decorators
+        for method in FASTAPI_ROUTE_DECORATORS:
+            if f".{method}(" in dec_str or f"@{method}(" in dec_str:
+                return True
+        # Also check for router patterns
+        if "@router." in dec_str or "@app." in dec_str:
+            for method in FASTAPI_ROUTE_DECORATORS:
+                if method in dec_str:
+                    return True
+    return False
+
+
+def is_flask_route(func: Dict[str, Any]) -> bool:
+    """
+    Detect if a function is a Flask route handler via decorators.
+
+    Flask routes are identified by:
+    - @app.route("/path")
+    - @blueprint.route("/path")
+
+    Returns:
+        True if the function is a Flask route handler
+    """
+    decorators = func.get("decorators", [])
+    for dec in decorators:
+        dec_str = str(dec).lower()
+        if ".route(" in dec_str or "@route(" in dec_str:
+            return True
+    return False
+
+
+def has_dependency_injection(func: Dict[str, Any]) -> bool:
+    """
+    Check if a function uses FastAPI Depends() for dependency injection.
+
+    Args:
+        func: Function dict from analysis
+
+    Returns:
+        True if the function uses Depends()
+    """
+    # Check function signature/parameters for Depends
+    params = func.get("parameters", []) or func.get("args", [])
+    for param in params:
+        param_str = str(param).lower()
+        if "depends(" in param_str:
+            return True
+
+    # Check decorators
+    decorators = func.get("decorators", [])
+    for dec in decorators:
+        if "depends" in str(dec).lower():
+            return True
+
+    return False
+
+
 def get_pure_functions(compact: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Get functions that are pure (not route handlers).
 
     Pure functions are suitable for unit testing.
-    Route handlers should be tested via integration tests.
+    Route handlers should be tested via integration tests (Flask) or unit tests (FastAPI).
     """
     functions = compact.get("functions", [])
     routes = compact.get("routes", [])
@@ -334,6 +453,37 @@ def get_pure_functions(compact: Dict[str, Any]) -> List[Dict[str, Any]]:
                 pure_functions.append(func)
 
     return pure_functions
+
+
+def get_fastapi_routes(compact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Get FastAPI route functions from the compact analysis.
+
+    FastAPI routes ARE unit-testable (unlike Flask routes).
+
+    Returns:
+        List of FastAPI route functions
+    """
+    functions = compact.get("functions", [])
+    routes = compact.get("routes", [])
+    fastapi_routes = compact.get("fastapi_routes", [])
+
+    # Combine explicit fastapi_routes with detected ones
+    all_routes = list(fastapi_routes)
+
+    # Check functions for FastAPI decorators
+    for func in functions:
+        if is_fastapi_route(func):
+            if func not in all_routes:
+                all_routes.append(func)
+
+    # Also check routes list
+    for route in routes:
+        if is_fastapi_route(route):
+            if route not in all_routes:
+                all_routes.append(route)
+
+    return all_routes
 
 
 def _is_route_like_function(name: str, func: Dict[str, Any]) -> bool:
@@ -405,33 +555,60 @@ def _is_view_class(cls: Dict[str, Any]) -> bool:
     return False
 
 
-def targets_count(compact: Dict[str, Any], kind: str) -> int:
+def targets_count(compact: Dict[str, Any], kind: str, framework: str = "universal") -> int:
+    """
+    Count testable targets for a given test kind.
+
+    CRITICAL DIFFERENCE:
+    - Flask: routes → integration tests ONLY
+    - FastAPI: routes → unit OR integration tests (routes are unit-testable!)
+    """
     functions = compact.get("functions", [])
     classes = compact.get("classes", [])
     methods = compact.get("methods", [])
     routes = compact.get("routes", [])
 
     if kind == "unit":
-        # Only count PURE functions for unit tests, not route handlers
+        # Pure functions for unit tests
         pure_funcs = get_pure_functions(compact)
         utility_classes = [c for c in classes if not _is_view_class(c)]
         utility_methods = [m for m in methods if not _is_route_like_function(m.get("name", ""), m)]
-        return len(pure_funcs) + len(utility_classes) + len(utility_methods)
+
+        base_count = len(pure_funcs) + len(utility_classes) + len(utility_methods)
+
+        # FASTAPI DIFFERENCE: Routes ARE unit-testable!
+        if framework == "fastapi":
+            fastapi_routes = get_fastapi_routes(compact)
+            # FastAPI routes can be tested with TestClient in unit tests
+            base_count += len(fastapi_routes)
+
+        return base_count
+
     if kind == "e2e":
         return len(routes)
+
+    # Integration tests
     return max(len(functions) + len(classes) + len(methods), len(routes))
 
 
-def files_per_kind(compact: Dict[str, Any], kind: str) -> int:
-    """Distribute ALL targets across appropriate number of files."""
+def files_per_kind(compact: Dict[str, Any], kind: str, framework: str = "universal") -> int:
+    """
+    Distribute ALL targets across appropriate number of files.
 
-    total_targets = targets_count(compact, kind)
+    CRITICAL: Framework affects what can be unit tested:
+    - Flask: routes → integration only (no unit test for routes)
+    - FastAPI: routes → unit testable (TestClient makes routes unit-testable)
+    """
+    total_targets = targets_count(compact, kind, framework)
 
-    # For unit tests: if no pure functions, generate 0 files
+    # For unit tests: check based on framework
     if kind == "unit":
         if total_targets == 0:
-            print("   ℹ️  No pure functions found - skipping unit test generation")
-            print("   ℹ️  Routes will be tested via integration tests instead")
+            if framework == "fastapi":
+                print("   ℹ️  No pure functions or FastAPI routes found - skipping unit test generation")
+            else:
+                print("   ℹ️  No pure functions found - skipping unit test generation")
+                print("   ℹ️  Routes will be tested via integration tests instead")
             return 0
         return max(1, (total_targets + 49) // 50)
 
@@ -533,6 +710,9 @@ def build_prompt(kind: str, compact_json: str, focus_label: str, shard: int, tot
     # Get test category rules specific to this test kind
     test_category_guidance = _get_test_category_guidance(kind, framework)
 
+    # Add FastAPI-specific error rules if applicable
+    fastapi_rules = FASTAPI_ERROR_RULES if framework == "fastapi" else ""
+
     user_content = f"""
 {framework.upper()} {kind.upper()} TEST GENERATION - FILE {shard + 1}/{total}
 
@@ -545,6 +725,8 @@ DETECTED FRAMEWORK: {framework.upper()}
 {test_category_guidance}
 
 {NEVER_DO_RULES}
+
+{fastapi_rules}
 
 {dev_instructions}
 {merged_rules}
@@ -655,8 +837,16 @@ def _get_anti_patterns(framework: str) -> str:
             "FASTAPI-SPECIFIC ANTI-PATTERNS:\n"
             "- Do NOT use @pytest.mark.django_db - this is FastAPI\n"
             "- Do NOT use Django's RequestFactory or QueryDict\n"
-            "- Do NOT use Flask's test_client()\n"
+            "- Do NOT use Flask's test_client() - use TestClient from fastapi.testclient\n"
             "- Do NOT write: app = FastAPI() - IMPORT the real app instead\n"
+            "- Do NOT expect 400 for validation errors - FastAPI returns 422!\n"
+            "- Do NOT mock dependencies unless they fail without mocking\n"
+            "\n"
+            "FASTAPI ERROR CODES (CRITICAL):\n"
+            "- Validation error (missing/wrong field) → 422 (NOT 400!)\n"
+            "- Route not found → 404\n"
+            "- Explicit HTTPException(400) → 400\n"
+            "- Unhandled exception → 500\n"
         )
     else:
         return universal_anti
@@ -665,7 +855,39 @@ def _get_anti_patterns(framework: str) -> str:
 def _get_test_category_guidance(kind: str, framework: str) -> str:
     """Get specific guidance for each test category to prevent misclassification."""
     if kind == "unit":
-        return f"""
+        # FastAPI routes ARE unit-testable - this is the key difference!
+        if framework == "fastapi":
+            return """
+🎯 UNIT TEST SPECIFIC GUIDANCE (FASTAPI):
+
+FOR THIS UNIT TEST FILE, YOU MUST:
+✅ Test pure functions and utility methods
+✅ Test data validation functions
+✅ Test FastAPI routes using TestClient (routes ARE unit-testable!)
+✅ Test Pydantic model validation
+✅ Test helper methods and utilities
+
+FASTAPI ROUTES ARE UNIT-TESTABLE:
+```python
+def test_create_item(client):
+    res = client.post("/items", json={"name": "Test", "price": 10})
+    assert res.status_code == 201
+    assert res.json()["name"] == "Test"
+
+def test_create_item_validation(client):
+    res = client.post("/items", json={})
+    assert res.status_code == 422  # NOT 400!
+```
+
+FOR THIS UNIT TEST FILE, YOU MUST NOT:
+❌ Create fake apps (app = FastAPI() is WRONG)
+❌ Expect 400 for validation errors (FastAPI returns 422!)
+❌ Mock dependencies unless absolutely necessary
+
+REMEMBER: FastAPI routes ARE unit-testable with TestClient!
+"""
+        else:
+            return f"""
 🎯 UNIT TEST SPECIFIC GUIDANCE ({framework.upper()}):
 
 FOR THIS UNIT TEST FILE, YOU MUST:
@@ -677,7 +899,7 @@ FOR THIS UNIT TEST FILE, YOU MUST:
 FOR THIS UNIT TEST FILE, YOU MUST NOT:
 ❌ Test routes/endpoints - those belong in integration tests
 ❌ Use client.get(), client.post() - that's integration testing
-❌ Create any Flask/Django/FastAPI app instances
+❌ Create any Flask/Django app instances
 ❌ Test HTTP request/response - that's integration testing
 
 If the codebase only has routes/views and no pure functions,
@@ -687,7 +909,33 @@ or generate minimal placeholder tests.
 REMEMBER: Routes ≠ Unit Tests. Routes = Integration Tests.
 """
     elif kind == "integ":
-        return f"""
+        if framework == "fastapi":
+            return """
+🎯 INTEGRATION TEST SPECIFIC GUIDANCE (FASTAPI):
+
+FOR THIS INTEGRATION TEST FILE, YOU MUST:
+✅ Test complete API workflows
+✅ Test database interactions (if applicable)
+✅ Test service integrations
+✅ Use the client fixture from conftest.py
+✅ Test error handling with correct status codes
+
+FASTAPI ERROR CODES (CRITICAL):
+- Validation error → 422 (NOT 400!)
+- Not found → 404
+- Auth failure → 401/403
+- Server error → 500
+
+FOR THIS INTEGRATION TEST FILE, YOU MUST NOT:
+❌ Create fake apps (app = FastAPI() is WRONG)
+❌ Expect 400 for Pydantic validation errors
+❌ Define routes inside the test file
+❌ Redefine the client fixture
+
+CRITICAL: Import the REAL app, don't create a fake one!
+"""
+        else:
+            return f"""
 🎯 INTEGRATION TEST SPECIFIC GUIDANCE ({framework.upper()}):
 
 FOR THIS INTEGRATION TEST FILE, YOU MUST:
@@ -781,6 +1029,21 @@ def test_example_json_api(client):
     assert response.status_code in [200, 201]
     data = response.json()
     assert data is not None
+
+def test_validation_error(client):
+    """FastAPI returns 422 for validation errors, NOT 400!"""
+    response = client.post('/api/endpoint', json={})  # Missing required fields
+    assert response.status_code == 422  # CRITICAL: FastAPI uses 422!
+
+def test_wrong_type_validation(client):
+    """FastAPI validates types via Pydantic."""
+    response = client.post('/api/endpoint', json={"count": "not_a_number"})
+    assert response.status_code == 422  # Type validation error
+
+def test_auth_required(client):
+    """Test endpoint that requires authentication."""
+    response = client.get('/api/protected')
+    assert response.status_code in (200, 401)  # Don't assume auth behavior
 '''
     else:
         return UNIVERSAL_SCAFFOLD

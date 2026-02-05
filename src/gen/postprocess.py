@@ -749,6 +749,117 @@ def remove_html_assertions(code: str) -> str:
     return '\n'.join(result_lines)
 
 
+def detect_fastapi_wrong_error_codes(code: str) -> List[str]:
+    """
+    Detect if FastAPI tests incorrectly expect 400 for validation errors.
+
+    FastAPI uses 422 for Pydantic validation errors, NOT 400!
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    # Patterns that suggest wrong error code expectations
+    wrong_patterns = [
+        # Expecting 400 for empty/invalid JSON (should be 422)
+        (r'assert\s+.*status_code\s*==\s*400.*#.*valid', 'Expecting 400 for validation (should be 422 in FastAPI)'),
+        (r'assert\s+.*status_code\s*==\s*400.*#.*missing', 'Expecting 400 for missing field (should be 422 in FastAPI)'),
+        (r'assert\s+.*status_code\s*==\s*400.*#.*invalid', 'Expecting 400 for invalid data (should be 422 in FastAPI)'),
+        (r'assert\s+.*status_code\s*==\s*400.*#.*required', 'Expecting 400 for required field (should be 422 in FastAPI)'),
+        # JSON payload tests followed by 400 assertion
+        (r'json\s*=\s*\{\s*\}.*\n.*status_code\s*==\s*400', 'Empty JSON payload expects 400 (should be 422 in FastAPI)'),
+    ]
+
+    for pattern, message in wrong_patterns:
+        if re.search(pattern, code, re.IGNORECASE | re.MULTILINE):
+            issues.append(message)
+
+    return issues
+
+
+def fix_fastapi_error_codes(code: str) -> str:
+    """
+    Fix incorrect 400 status codes to 422 for FastAPI validation errors.
+
+    FastAPI uses 422 for Pydantic validation, not 400.
+    """
+    lines = code.split('\n')
+    result_lines = []
+
+    # Context tracking
+    in_validation_test = False
+
+    for i, line in enumerate(lines):
+        # Check if we're in a validation test function
+        if 'def test_' in line and any(word in line.lower() for word in ['valid', 'invalid', 'missing', 'required', 'error']):
+            in_validation_test = True
+        elif line.strip().startswith('def '):
+            in_validation_test = False
+
+        # Fix 400 → 422 for validation contexts
+        if in_validation_test and 'status_code' in line and '== 400' in line:
+            # Check context - is this a validation error test?
+            context_lines = '\n'.join(lines[max(0, i-5):i+1]).lower()
+            if any(word in context_lines for word in ['json={}', 'json = {}', 'missing', 'invalid', 'required', 'validation']):
+                line = line.replace('== 400', '== 422')
+                line = line.rstrip() + '  # FastAPI validation error\n' if not line.endswith('\n') else line.rstrip() + '  # FastAPI validation error'
+
+        result_lines.append(line)
+
+    return '\n'.join(result_lines)
+
+
+def detect_direct_route_imports(code: str, framework: str) -> List[str]:
+    """
+    Detect if tests import route functions directly (wrong for Flask).
+
+    Flask routes should be tested via test_client, not direct imports.
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    if framework != "flask":
+        return issues  # Only relevant for Flask
+
+    # Patterns for direct route imports
+    route_import_patterns = [
+        (r'from\s+app\s+import\s+.*(?:index|home|get_|post_|create_|update_|delete_)', 'Direct route import (use client instead)'),
+        (r'from\s+\w+\s+import\s+.*@app\.route', 'Direct import of route handler'),
+    ]
+
+    for pattern, message in route_import_patterns:
+        if re.search(pattern, code, re.IGNORECASE):
+            issues.append(message)
+
+    return issues
+
+
+def validate_generated_test(code: str, framework: str) -> List[str]:
+    """
+    Validate generated test code for common issues.
+
+    Returns list of validation errors/warnings.
+    """
+    issues = []
+
+    # Check for fake app definitions
+    issues.extend(detect_fake_app_definitions(code, framework))
+
+    # Check for HTML assertions
+    issues.extend(detect_html_assertions(code))
+
+    # FastAPI-specific: check for wrong error codes
+    if framework == "fastapi":
+        issues.extend(detect_fastapi_wrong_error_codes(code))
+
+    # Flask-specific: check for direct route imports
+    if framework == "flask":
+        issues.extend(detect_direct_route_imports(code, framework))
+
+    return issues
+
+
 def cleanup_generated_test(code: str, framework: str = "universal") -> str:
     """
     Apply all cleanup operations to generated test code.
@@ -760,6 +871,11 @@ def cleanup_generated_test(code: str, framework: str = "universal") -> str:
     Returns:
         Cleaned up code
     """
+    # Validate and log all issues first
+    all_issues = validate_generated_test(code, framework)
+    if all_issues:
+        print(f"   ⚠️  Validation issues found: {all_issues}")
+
     # Detect and log issues first
     fake_app_issues = detect_fake_app_definitions(code, framework)
     html_issues = detect_html_assertions(code)
@@ -783,6 +899,10 @@ def cleanup_generated_test(code: str, framework: str = "universal") -> str:
 
     # Fix global state patterns
     code = fix_global_state_patterns(code)
+
+    # FastAPI-specific: fix 400 → 422 for validation errors
+    if framework == "fastapi":
+        code = fix_fastapi_error_codes(code)
 
     # Remove excessive blank lines
     code = re.sub(r'\n{4,}', '\n\n\n', code)

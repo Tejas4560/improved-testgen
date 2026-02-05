@@ -47,46 +47,74 @@ except Exception as _e:
     def massage(code: str): return code
 
 def _detect_framework(analysis: Dict[str, Any], target_root: pathlib.Path) -> str:
-    """Detect the framework from analysis or by inspecting the target directory."""
+    """
+    Detect the framework from analysis or by inspecting the target directory.
+
+    CRITICAL: Detect statically, do NOT import user code.
+
+    Detection priority:
+    1. FastAPI (from fastapi import FastAPI, import fastapi)
+    2. Flask (from flask import Flask, import flask)
+    3. Django (from django..., import django)
+    4. Universal (fallback)
+    """
     # Check if framework is already in analysis
     if "framework" in analysis:
         return analysis["framework"].lower()
 
-    # Check imports for framework detection
+    # Build imports text for exact matching
+    imports_text = ""
     imports = analysis.get("imports", [])
-    import_names = set()
     for imp in imports:
         if isinstance(imp, dict):
-            import_names.add(imp.get("module", "").lower())
-            import_names.add(imp.get("name", "").lower())
+            imports_text += f" {imp.get('module', '')} {imp.get('name', '')} "
         elif isinstance(imp, str):
-            import_names.add(imp.lower())
+            imports_text += f" {imp} "
+
+    imports_text = imports_text.lower()
+
+    # STATIC DETECTION - Do NOT import user code
+    # Check for FastAPI FIRST (more specific than Flask)
+    if "from fastapi import fastapi" in imports_text or "import fastapi" in imports_text:
+        return "fastapi"
+    if "from fastapi" in imports_text:
+        return "fastapi"
 
     # Check for Flask
-    if any("flask" in i for i in import_names):
+    if "from flask import flask" in imports_text or "import flask" in imports_text:
+        return "flask"
+    if "from flask" in imports_text:
         return "flask"
 
     # Check for Django
-    if any("django" in i for i in import_names):
+    if "from django" in imports_text or "import django" in imports_text:
         return "django"
 
-    # Check for FastAPI
-    if any("fastapi" in i for i in import_names):
-        return "fastapi"
-
-    # Check files in target directory
+    # Check files in target directory for more thorough detection
     try:
         for py_file in target_root.glob("**/*.py"):
             if "venv" in str(py_file) or "site-packages" in str(py_file):
                 continue
+            if "test" in str(py_file).lower():
+                continue  # Skip test files
             try:
                 content = py_file.read_text(encoding='utf-8', errors='ignore')
-                if "from flask" in content or "import flask" in content:
+
+                # FastAPI detection (check first - more specific)
+                if "from fastapi import FastAPI" in content:
+                    return "fastapi"
+                if "import fastapi" in content:
+                    return "fastapi"
+
+                # Flask detection
+                if "from flask import Flask" in content:
                     return "flask"
+                if "import flask" in content:
+                    return "flask"
+
+                # Django detection
                 if "from django" in content or "import django" in content:
                     return "django"
-                if "from fastapi" in content or "import fastapi" in content:
-                    return "fastapi"
             except Exception:
                 continue
     except Exception:
@@ -755,7 +783,7 @@ def generate_all(analysis: Dict[str, Any], outdir: str = "tests/generated",
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     
     for test_kind in test_kinds:
-        num_files = files_per_kind(compact, test_kind)
+        num_files = files_per_kind(compact, test_kind, detected_framework)
         if num_files <= 0:
             continue
         

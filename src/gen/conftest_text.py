@@ -395,6 +395,33 @@ def auth_headers():
 def mock_db():
     """Mock database for testing without real DB."""
     return {}
+
+
+@pytest.fixture
+def override_dependencies(app):
+    """
+    Override FastAPI dependencies for testing.
+
+    Usage:
+        def test_with_mock_db(client, override_dependencies):
+            # Dependencies are overridden for this test
+            pass
+
+    To override specific dependencies:
+        app.dependency_overrides[get_db] = lambda: mock_db
+    """
+    original_overrides = app.dependency_overrides.copy()
+    yield app.dependency_overrides
+    # Restore original dependencies after test
+    app.dependency_overrides.clear()
+    app.dependency_overrides.update(original_overrides)
+
+
+@pytest.fixture(autouse=True)
+def reset_dependency_overrides(app):
+    """Auto-reset dependency overrides after each test."""
+    yield
+    app.dependency_overrides.clear()
 '''
 
 
