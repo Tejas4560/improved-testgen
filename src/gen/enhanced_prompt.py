@@ -307,30 +307,138 @@ def parametrized_test_cases():
     ]
 '''
 
+def get_pure_functions(compact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Get functions that are pure (not route handlers).
+
+    Pure functions are suitable for unit testing.
+    Route handlers should be tested via integration tests.
+    """
+    functions = compact.get("functions", [])
+    routes = compact.get("routes", [])
+
+    # Get all route handler names
+    route_handlers = set()
+    for route in routes:
+        handler = route.get("handler") or route.get("function") or route.get("name")
+        if handler:
+            route_handlers.add(handler)
+
+    # Filter out route handlers from functions
+    pure_functions = []
+    for func in functions:
+        func_name = func.get("name")
+        if func_name and func_name not in route_handlers:
+            # Also filter out common Flask/Django/FastAPI patterns
+            if not _is_route_like_function(func_name, func):
+                pure_functions.append(func)
+
+    return pure_functions
+
+
+def _is_route_like_function(name: str, func: Dict[str, Any]) -> bool:
+    """
+    Check if a function looks like a route handler based on naming/decorators.
+    """
+    # Common route handler names
+    route_like_names = {
+        'index', 'home', 'get', 'post', 'put', 'delete', 'patch',
+        'create', 'update', 'destroy', 'show', 'edit', 'new',
+        'list', 'detail', 'api', 'view', 'handler'
+    }
+
+    # Check if name contains route-like patterns
+    name_lower = name.lower()
+    for pattern in route_like_names:
+        if pattern in name_lower:
+            # Check if it's decorated with route decorators
+            decorators = func.get("decorators", [])
+            if decorators:
+                for dec in decorators:
+                    dec_str = str(dec).lower()
+                    if any(x in dec_str for x in ['route', 'get', 'post', 'put', 'delete', 'api']):
+                        return True
+
+    # Check decorators directly
+    decorators = func.get("decorators", [])
+    for dec in decorators:
+        dec_str = str(dec).lower()
+        if any(x in dec_str for x in ['@app.route', '@router', '@api_view', '@get', '@post']):
+            return True
+
+    return False
+
+
+def has_pure_functions(compact: Dict[str, Any]) -> bool:
+    """
+    Check if the codebase has any pure functions suitable for unit testing.
+    """
+    pure_funcs = get_pure_functions(compact)
+    classes = compact.get("classes", [])
+    methods = compact.get("methods", [])
+
+    # Also check for utility classes/methods (not views/handlers)
+    utility_classes = [c for c in classes if not _is_view_class(c)]
+    utility_methods = [m for m in methods if not _is_route_like_function(m.get("name", ""), m)]
+
+    return len(pure_funcs) > 0 or len(utility_classes) > 0 or len(utility_methods) > 0
+
+
+def _is_view_class(cls: Dict[str, Any]) -> bool:
+    """Check if a class is a view/handler class."""
+    name = cls.get("name", "").lower()
+    bases = cls.get("bases", [])
+
+    # Common view class patterns
+    view_patterns = ['view', 'handler', 'api', 'resource', 'viewset', 'controller']
+
+    for pattern in view_patterns:
+        if pattern in name:
+            return True
+
+    # Check base classes
+    for base in bases:
+        base_str = str(base).lower()
+        if any(x in base_str for x in view_patterns):
+            return True
+
+    return False
+
+
 def targets_count(compact: Dict[str, Any], kind: str) -> int:
     functions = compact.get("functions", [])
     classes = compact.get("classes", [])
     methods = compact.get("methods", [])
     routes = compact.get("routes", [])
-    
+
     if kind == "unit":
-        return len(functions) + len(classes) + len(methods)
+        # Only count PURE functions for unit tests, not route handlers
+        pure_funcs = get_pure_functions(compact)
+        utility_classes = [c for c in classes if not _is_view_class(c)]
+        utility_methods = [m for m in methods if not _is_route_like_function(m.get("name", ""), m)]
+        return len(pure_funcs) + len(utility_classes) + len(utility_methods)
     if kind == "e2e":
         return len(routes)
     return max(len(functions) + len(classes) + len(methods), len(routes))
 
+
 def files_per_kind(compact: Dict[str, Any], kind: str) -> int:
     """Distribute ALL targets across appropriate number of files."""
-    
+
     total_targets = targets_count(compact, kind)
+
+    # For unit tests: if no pure functions, generate 0 files
+    if kind == "unit":
+        if total_targets == 0:
+            print("   ℹ️  No pure functions found - skipping unit test generation")
+            print("   ℹ️  Routes will be tested via integration tests instead")
+            return 0
+        return max(1, (total_targets + 49) // 50)
+
     if total_targets == 0:
         return 0
-    
-    targets_per_file = 50
-    
-    if kind == "unit":
-        return max(1, (total_targets + targets_per_file - 1) // targets_per_file)
-    elif kind == "e2e":
+
+    if kind == "e2e":
         return max(1, (total_targets + 19) // 20)
     else:
         return max(1, (total_targets + 29) // 30)
