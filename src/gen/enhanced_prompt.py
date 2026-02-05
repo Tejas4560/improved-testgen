@@ -56,6 +56,96 @@ SYSTEM_PROMPTS = {
 # Default for backward compatibility
 SYSTEM_MIN = SYSTEM_PROMPTS["universal"]
 
+# ============================================================================
+# STRICT TEST GENERATION RULES (NON-NEGOTIABLE)
+# ============================================================================
+
+OBSERVABLE_BEHAVIOR_RULES = """
+🔒 OBSERVABLE BEHAVIOR ONLY - NON-NEGOTIABLE RULES
+
+You may ONLY assert things that are GUARANTEED by the backend code:
+✅ ALLOWED TO ASSERT:
+   - HTTP status codes (200, 201, 400, 404, 500, etc.)
+   - JSON response structure (keys that exist in the code)
+   - Required fields and their types
+   - Error message keys (not exact text unless hardcoded)
+   - Content-Type headers
+   - List lengths when deterministic
+   - ID presence (not specific values)
+
+❌ NEVER ASSERT (will cause false failures):
+   - HTML content, titles, or structure (e.g., '<title>Task Manager</title>')
+   - Emojis or decorative text (e.g., '✨ Task Manager')
+   - Specific UI text that isn't in backend code
+   - CSS classes or styling
+   - Exact error message wording (unless hardcoded in backend)
+   - Timestamps or auto-generated IDs (use 'is not None' instead)
+   - Order of items unless explicitly sorted in backend
+
+RULE: If it's not EXPLICITLY in the backend code, don't assert it.
+"""
+
+STRICT_TEST_CATEGORIES = """
+🎯 STRICT TEST CATEGORIES - WHAT EACH TYPE MUST TEST
+
+UNIT TESTS (test_unit_*.py):
+   ✅ Pure functions with no side effects
+   ✅ Utility functions
+   ✅ Data validation functions
+   ✅ Helper methods
+   ✅ Class methods that don't require HTTP
+   ❌ NOT routes/endpoints (those are integration tests)
+   ❌ NOT Flask/Django/FastAPI views
+
+INTEGRATION TESTS (test_integ_*.py):
+   ✅ API endpoints via test client
+   ✅ Database operations
+   ✅ Service interactions
+   ✅ Real HTTP request/response cycles
+   ❌ NOT creating fake apps - use REAL app
+
+END-TO-END TESTS (test_e2e_*.py):
+   ✅ Complete user workflows via API
+   ✅ Multi-step operations (create → read → update → delete)
+   ✅ Full request/response cycles
+   ✅ State built via API calls (not direct manipulation)
+   ❌ NOT HTML/UI assertions
+   ❌ NOT creating fake apps
+
+CRITICAL: Routes are INTEGRATION tests, not unit tests!
+"""
+
+NEVER_DO_RULES = """
+🚫 ABSOLUTE PROHIBITIONS - NEVER DO THESE
+
+1. NEVER CREATE FAKE APPS:
+   ❌ app = Flask(__name__)  # WRONG - creates fake app
+   ❌ app = FastAPI()        # WRONG - creates fake app
+   ✅ from app import app    # CORRECT - import real app
+
+2. NEVER ASSUME HTML CONTENT:
+   ❌ assert '<title>' in response  # WRONG - assumes HTML
+   ❌ assert '✨' in response       # WRONG - assumes emoji
+   ✅ assert response.status_code == 200  # CORRECT
+
+3. NEVER MANIPULATE GLOBAL STATE DIRECTLY:
+   ❌ tasks = []           # WRONG - direct global manipulation
+   ❌ tasks.clear()        # WRONG - bypasses app logic
+   ✅ client.delete('/api/tasks/1')  # CORRECT - use API
+
+4. NEVER ASSUME EXECUTION ORDER:
+   ❌ Test that depends on previous test's state
+   ✅ Each test sets up its own state via API calls
+
+5. NEVER REDEFINE CONFTEST FIXTURES:
+   ❌ @pytest.fixture def client(): ...  # WRONG - already in conftest
+   ✅ def test_foo(client): ...          # CORRECT - use existing
+
+6. NEVER USE WRONG FRAMEWORK MARKERS:
+   ❌ @pytest.mark.django_db  # WRONG for Flask/FastAPI
+   ✅ Use markers matching detected framework only
+"""
+
 # Universal test templates for any project
 UNIT_ENHANCED = (
     "Generate COMPREHENSIVE UNIT tests for ANY Python code:\n"
@@ -332,10 +422,21 @@ def build_prompt(kind: str, compact_json: str, focus_label: str, shard: int, tot
     # Framework-specific instructions to AVOID wrong patterns
     anti_patterns = _get_anti_patterns(framework)
 
+    # Get test category rules specific to this test kind
+    test_category_guidance = _get_test_category_guidance(kind, framework)
+
     user_content = f"""
 {framework.upper()} {kind.upper()} TEST GENERATION - FILE {shard + 1}/{total}
 
 DETECTED FRAMEWORK: {framework.upper()}
+
+{OBSERVABLE_BEHAVIOR_RULES}
+
+{STRICT_TEST_CATEGORIES}
+
+{test_category_guidance}
+
+{NEVER_DO_RULES}
 
 {dev_instructions}
 {merged_rules}
@@ -345,10 +446,12 @@ DETECTED FRAMEWORK: {framework.upper()}
 {anti_patterns}
 
 CRITICAL REQUIREMENTS:
+- ALWAYS import the REAL app (from app import app) - NEVER create fake apps
 - Do NOT define fixtures that already exist in conftest.py (client, app, sample_data)
-- Do NOT create duplicate fixture definitions in test files
+- Do NOT assert on HTML content, titles, emojis, or UI text
+- Build test state via API calls, NOT direct global manipulation
+- Each test must be isolated - do NOT depend on other tests
 - Every @pytest.mark.parametrize name MUST appear in the function signature
-- Never repeat the same keyword in a call (e.g., Mock(name=...) only once)
 - Generate syntactically valid Python
 
 FOCUS TARGETS: {focus_label}
@@ -409,31 +512,111 @@ def _get_framework_rules(framework: str) -> str:
 
 def _get_anti_patterns(framework: str) -> str:
     """Get instructions for what NOT to do based on framework."""
+    # Universal anti-patterns for ALL frameworks
+    universal_anti = (
+        "🚫 UNIVERSAL ANTI-PATTERNS (NEVER DO THESE):\n"
+        "- NEVER create a fake app (e.g., app = Flask(__name__) or app = FastAPI())\n"
+        "- ALWAYS import the REAL app: from app import app\n"
+        "- NEVER assert HTML content, titles, or emojis\n"
+        "- NEVER manipulate global state directly (e.g., tasks = [], tasks.clear())\n"
+        "- NEVER assume test execution order - each test must be isolated\n"
+        "- NEVER redefine fixtures that exist in conftest.py (client, app, sample_data)\n"
+        "- NEVER assert on timestamps or auto-generated IDs with exact values\n"
+        "\n"
+    )
+
     if framework == "flask":
-        return (
-            "FLASK ANTI-PATTERNS (DO NOT USE):\n"
+        return universal_anti + (
+            "FLASK-SPECIFIC ANTI-PATTERNS:\n"
             "- Do NOT use @pytest.mark.django_db - this is Flask\n"
             "- Do NOT use Django's RequestFactory or QueryDict\n"
             "- Do NOT use Django's Client - use Flask's test_client()\n"
             "- Do NOT import from django.* modules\n"
-            "- Do NOT define @pytest.fixture def client() - it's in conftest.py\n"
+            "- Do NOT write: app = Flask(__name__) - IMPORT the real app instead\n"
         )
     elif framework == "django":
-        return (
-            "DJANGO ANTI-PATTERNS (DO NOT USE):\n"
+        return universal_anti + (
+            "DJANGO-SPECIFIC ANTI-PATTERNS:\n"
             "- Do NOT use Flask's test_client()\n"
             "- Do NOT import from flask.* modules\n"
             "- Do NOT use FastAPI's TestClient\n"
-            "- Do NOT define @pytest.fixture def client() - it's in conftest.py\n"
+            "- Do NOT create fake Django apps - use the real one\n"
         )
     elif framework == "fastapi":
-        return (
-            "FASTAPI ANTI-PATTERNS (DO NOT USE):\n"
+        return universal_anti + (
+            "FASTAPI-SPECIFIC ANTI-PATTERNS:\n"
             "- Do NOT use @pytest.mark.django_db - this is FastAPI\n"
             "- Do NOT use Django's RequestFactory or QueryDict\n"
             "- Do NOT use Flask's test_client()\n"
-            "- Do NOT define @pytest.fixture def client() - it's in conftest.py\n"
+            "- Do NOT write: app = FastAPI() - IMPORT the real app instead\n"
         )
+    else:
+        return universal_anti
+
+
+def _get_test_category_guidance(kind: str, framework: str) -> str:
+    """Get specific guidance for each test category to prevent misclassification."""
+    if kind == "unit":
+        return f"""
+🎯 UNIT TEST SPECIFIC GUIDANCE ({framework.upper()}):
+
+FOR THIS UNIT TEST FILE, YOU MUST:
+✅ Test ONLY pure functions and utility methods
+✅ Test data validation functions
+✅ Test helper methods that don't require HTTP
+✅ Test class methods with direct calls (not via HTTP)
+
+FOR THIS UNIT TEST FILE, YOU MUST NOT:
+❌ Test routes/endpoints - those belong in integration tests
+❌ Use client.get(), client.post() - that's integration testing
+❌ Create any Flask/Django/FastAPI app instances
+❌ Test HTTP request/response - that's integration testing
+
+If the codebase only has routes/views and no pure functions,
+generate tests for utility logic WITHIN those functions,
+or generate minimal placeholder tests.
+
+REMEMBER: Routes ≠ Unit Tests. Routes = Integration Tests.
+"""
+    elif kind == "integ":
+        return f"""
+🎯 INTEGRATION TEST SPECIFIC GUIDANCE ({framework.upper()}):
+
+FOR THIS INTEGRATION TEST FILE, YOU MUST:
+✅ Test API endpoints via the client fixture
+✅ Use client.get(), client.post(), client.put(), client.delete()
+✅ Import the REAL app: from app import app
+✅ Test request/response cycles
+✅ Assert on status codes and JSON structure
+
+FOR THIS INTEGRATION TEST FILE, YOU MUST NOT:
+❌ Create fake apps (app = Flask(__name__) is WRONG)
+❌ Define your own routes inside the test file
+❌ Assert on HTML content, titles, or emojis
+❌ Redefine the client fixture - it's in conftest.py
+
+CRITICAL: Import the REAL app, don't create a fake one!
+"""
+    elif kind == "e2e":
+        return f"""
+🎯 END-TO-END TEST SPECIFIC GUIDANCE ({framework.upper()}):
+
+FOR THIS E2E TEST FILE, YOU MUST:
+✅ Test complete user workflows via API
+✅ Chain operations: create → read → update → delete
+✅ Build state via API calls (POST to create data)
+✅ Clean up via API calls (DELETE) or rely on fixture reset
+✅ Use the client fixture from conftest.py
+
+FOR THIS E2E TEST FILE, YOU MUST NOT:
+❌ Create fake apps - use the REAL app
+❌ Assert on HTML/UI content
+❌ Manipulate global state directly (tasks = [])
+❌ Depend on other tests running first - each test is isolated
+
+STATE MANAGEMENT: Build state via API calls, not direct manipulation.
+Example: POST /api/tasks to create, then GET /api/tasks to verify.
+"""
     else:
         return ""
 

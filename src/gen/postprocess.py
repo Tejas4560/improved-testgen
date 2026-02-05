@@ -588,6 +588,167 @@ def fix_global_state_patterns(code: str) -> str:
     return code
 
 
+def detect_fake_app_definitions(code: str, framework: str) -> List[str]:
+    """
+    Detect fake app definitions in test code.
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    # Patterns for fake app creation (should import real app instead)
+    fake_app_patterns = [
+        (r'app\s*=\s*Flask\s*\(\s*__name__\s*\)', 'Flask app created in test (should import real app)'),
+        (r'app\s*=\s*FastAPI\s*\(\s*\)', 'FastAPI app created in test (should import real app)'),
+        (r'application\s*=\s*Flask\s*\(\s*__name__\s*\)', 'Flask application created in test'),
+        (r'application\s*=\s*FastAPI\s*\(\s*\)', 'FastAPI application created in test'),
+        (r'@app\.route\s*\(', 'Route defined in test file (indicates fake app)'),
+        (r'@application\.route\s*\(', 'Route defined in test file (indicates fake app)'),
+        (r'@app\.get\s*\(', 'FastAPI route defined in test file'),
+        (r'@app\.post\s*\(', 'FastAPI route defined in test file'),
+    ]
+
+    for pattern, message in fake_app_patterns:
+        if re.search(pattern, code):
+            issues.append(message)
+
+    return issues
+
+
+def detect_html_assertions(code: str) -> List[str]:
+    """
+    Detect assertions on HTML content that shouldn't be tested.
+
+    Returns list of issues found.
+    """
+    issues = []
+
+    # Patterns for HTML content assertions
+    html_patterns = [
+        (r"assert\s+['\"]<html", 'Assertion on HTML tag'),
+        (r"assert\s+['\"]<title", 'Assertion on title tag'),
+        (r"assert\s+['\"]<head", 'Assertion on head tag'),
+        (r"assert\s+['\"]<body", 'Assertion on body tag'),
+        (r"assert\s+['\"]<div", 'Assertion on div tag'),
+        (r"assert\s+['\"]<h1", 'Assertion on h1 tag'),
+        (r"assert\s+['\"]<!DOCTYPE", 'Assertion on DOCTYPE'),
+        (r"in\s+response.*['\"]<html", 'HTML check in response'),
+        (r"in\s+response.*['\"]<title", 'Title check in response'),
+        # Emoji assertions
+        (r"assert\s+['\"].*[\U0001F300-\U0001F9FF]", 'Assertion contains emoji'),
+        (r"in\s+response.*[\U0001F300-\U0001F9FF]", 'Response check contains emoji'),
+        # Common UI text that shouldn't be asserted
+        (r"assert\s+['\"].*Task Manager", 'Assertion on UI text'),
+        (r"assert\s+['\"].*Welcome to", 'Assertion on UI text'),
+    ]
+
+    for pattern, message in html_patterns:
+        if re.search(pattern, code, re.IGNORECASE):
+            issues.append(message)
+
+    return issues
+
+
+def remove_fake_app_definitions(code: str, framework: str) -> str:
+    """
+    Remove or comment out fake app definitions from test code.
+
+    This prevents tests from creating their own apps instead of importing the real one.
+    """
+    lines = code.split('\n')
+    result_lines = []
+    skip_mode = False
+    skip_indent = 0
+    route_block = False
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        current_indent = len(line) - len(line.lstrip())
+
+        # Detect fake app creation
+        if re.match(r'^\s*app\s*=\s*(Flask|FastAPI)\s*\(', line):
+            result_lines.append(f"# REMOVED: {stripped}  # Should import real app instead")
+            result_lines.append("# from app import app  # Use this instead")
+            i += 1
+            continue
+
+        # Detect route decorators (indicates fake app)
+        if re.match(r'^\s*@app\.(route|get|post|put|delete|patch)\s*\(', line):
+            route_block = True
+            skip_indent = current_indent
+            result_lines.append(f"# REMOVED FAKE ROUTE: {stripped}")
+            i += 1
+            continue
+
+        # Skip the function body after a route decorator
+        if route_block:
+            if stripped.startswith('def '):
+                # Start of function, continue skipping
+                result_lines.append(f"# REMOVED: {stripped}")
+                i += 1
+                continue
+            elif current_indent > skip_indent or not stripped:
+                # Still inside the function body
+                if stripped:
+                    result_lines.append(f"#     {stripped}")
+                i += 1
+                continue
+            else:
+                # Exited function body
+                route_block = False
+
+        result_lines.append(line)
+        i += 1
+
+    return '\n'.join(result_lines)
+
+
+def remove_html_assertions(code: str) -> str:
+    """
+    Remove or comment out HTML content assertions.
+
+    These assertions are fragile and test implementation details.
+    """
+    lines = code.split('\n')
+    result_lines = []
+
+    # Patterns to remove
+    html_assert_patterns = [
+        r"assert\s+['\"]<(?:html|title|head|body|div|h1|!DOCTYPE)",
+        r"assert\s+['\"][^'\"]*<(?:html|title|head|body|div|h1)",
+        r"in\s+response[^'\"]*['\"]<(?:html|title|head|body|div)",
+    ]
+
+    # Emoji patterns
+    emoji_pattern = r"[\U0001F300-\U0001F9FF\U00002702-\U000027B0\U0001F600-\U0001F64F]"
+
+    for line in lines:
+        stripped = line.strip()
+        should_comment = False
+
+        # Check for HTML assertions
+        for pattern in html_assert_patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                should_comment = True
+                break
+
+        # Check for emoji assertions
+        if not should_comment and 'assert' in line.lower():
+            if re.search(emoji_pattern, line):
+                should_comment = True
+
+        if should_comment:
+            indent = len(line) - len(line.lstrip())
+            result_lines.append(' ' * indent + f"# REMOVED HTML/EMOJI ASSERTION: {stripped}")
+            result_lines.append(' ' * indent + "pass  # Replace with status code assertion")
+        else:
+            result_lines.append(line)
+
+    return '\n'.join(result_lines)
+
+
 def cleanup_generated_test(code: str, framework: str = "universal") -> str:
     """
     Apply all cleanup operations to generated test code.
@@ -599,6 +760,21 @@ def cleanup_generated_test(code: str, framework: str = "universal") -> str:
     Returns:
         Cleaned up code
     """
+    # Detect and log issues first
+    fake_app_issues = detect_fake_app_definitions(code, framework)
+    html_issues = detect_html_assertions(code)
+
+    if fake_app_issues:
+        print(f"   ⚠️  Detected fake app issues: {fake_app_issues}")
+    if html_issues:
+        print(f"   ⚠️  Detected HTML assertion issues: {html_issues}")
+
+    # Remove fake app definitions (CRITICAL - prevents fake apps)
+    code = remove_fake_app_definitions(code, framework)
+
+    # Remove HTML content assertions (prevents fragile tests)
+    code = remove_html_assertions(code)
+
     # Remove duplicate fixtures
     code = remove_duplicate_fixtures(code, framework)
 
