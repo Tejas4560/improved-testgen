@@ -1,4 +1,4 @@
-# src/gen/enhanced_prompt.py - UNIVERSAL AGNOSTIC TEST GENERATION
+# src/gen/enhanced_prompt.py - FRAMEWORK-AWARE TEST GENERATION
 
 import json
 import os
@@ -6,17 +6,55 @@ import random
 from typing import Any, Dict, List, Optional, Tuple
 from .gap_aware_analysis import get_coverage_context_for_prompts, is_gap_focused_mode
 
-SYSTEM_MIN = (
-    "Generate comprehensive pytest test code that works with ANY Python project structure.\n"
-    "UNIVERSAL TESTING REQUIREMENTS:\n"
-    " - Use REAL imports and REAL code execution whenever possible\n"
-    " - Test both success paths AND error conditions\n"
-    " - Include edge cases: empty inputs, None values, invalid data\n"
-    " - Test ALL public methods, properties, and class attributes\n"
-    " - Generate multiple test methods per class/function for maximum coverage\n"
-    " - Return ONLY Python code, no markdown\n"
-    " - Be completely framework-agnostic and project-structure-agnostic\n"
-)
+# Framework-specific system prompts
+SYSTEM_PROMPTS = {
+    "flask": (
+        "Generate comprehensive pytest test code for a FLASK application.\n"
+        "FLASK-SPECIFIC REQUIREMENTS:\n"
+        " - Use Flask's test_client() for all HTTP testing\n"
+        " - Use app.test_client() from the 'client' fixture\n"
+        " - Do NOT use @pytest.mark.django_db - this is Flask, not Django\n"
+        " - Do NOT use Django's RequestFactory or QueryDict\n"
+        " - For JSON APIs, use client.post('/path', json={...})\n"
+        " - Check response.status_code and response.get_json()\n"
+        " - Use response.get_data(as_text=True) for HTML responses\n"
+        " - Return ONLY Python code, no markdown\n"
+    ),
+    "django": (
+        "Generate comprehensive pytest test code for a DJANGO application.\n"
+        "DJANGO-SPECIFIC REQUIREMENTS:\n"
+        " - Use Django's test Client or RequestFactory\n"
+        " - Mark database tests with @pytest.mark.django_db\n"
+        " - Use QueryDict for POST/GET data when needed\n"
+        " - Use django.test.Client for view testing\n"
+        " - Use RequestFactory for unit testing views\n"
+        " - Return ONLY Python code, no markdown\n"
+    ),
+    "fastapi": (
+        "Generate comprehensive pytest test code for a FASTAPI application.\n"
+        "FASTAPI-SPECIFIC REQUIREMENTS:\n"
+        " - Use FastAPI's TestClient from fastapi.testclient\n"
+        " - Do NOT use @pytest.mark.django_db - this is FastAPI, not Django\n"
+        " - For async endpoints, use pytest-asyncio or TestClient\n"
+        " - Use client.post('/path', json={...}) for JSON APIs\n"
+        " - Check response.status_code and response.json()\n"
+        " - Return ONLY Python code, no markdown\n"
+    ),
+    "universal": (
+        "Generate comprehensive pytest test code that works with ANY Python project structure.\n"
+        "UNIVERSAL TESTING REQUIREMENTS:\n"
+        " - Use REAL imports and REAL code execution whenever possible\n"
+        " - Test both success paths AND error conditions\n"
+        " - Include edge cases: empty inputs, None values, invalid data\n"
+        " - Test ALL public methods, properties, and class attributes\n"
+        " - Generate multiple test methods per class/function for maximum coverage\n"
+        " - Return ONLY Python code, no markdown\n"
+        " - Be completely framework-agnostic and project-structure-agnostic\n"
+    )
+}
+
+# Default for backward compatibility
+SYSTEM_MIN = SYSTEM_PROMPTS["universal"]
 
 # Universal test templates for any project
 UNIT_ENHANCED = (
@@ -258,16 +296,29 @@ def focus_for(compact: Dict[str, Any], kind: str, shard_idx: int, total_shards: 
 
 
 def build_prompt(kind: str, compact_json: str, focus_label: str, shard: int, total: int,
-                 compact: Dict[str, Any], context: str = "") -> List[Dict[str, str]]:
+                 compact: Dict[str, Any], context: str = "", framework: str = "universal") -> List[Dict[str, str]]:
     """
-    Final override (append-only): steer generation toward Django-correct patterns.
+    Build framework-aware test generation prompt.
+
+    Args:
+        kind: Test type (unit, integ, e2e)
+        compact_json: JSON representation of code analysis
+        focus_label: Label for focus targets
+        shard: Current shard index
+        total: Total number of shards
+        compact: Compact analysis dict
+        context: Additional context
+        framework: Detected framework (flask, django, fastapi, universal)
     """
-    SYSTEM_MIN_LOCAL = SYSTEM_MIN
+    # Select framework-specific system prompt
+    framework = framework.lower().strip() if framework else "universal"
+    SYSTEM_MIN_LOCAL = SYSTEM_PROMPTS.get(framework, SYSTEM_PROMPTS["universal"])
+
     test_instructions = {"unit": UNIT_ENHANCED, "integ": INTEG_ENHANCED, "e2e": E2E_ENHANCED}
     dev_instructions = test_instructions.get(kind, UNIT_ENHANCED)
     max_ctx = 60000
     trimmed_context = context[:max_ctx] if context else ""
-    merged_rules = _merge_universal_text()
+    merged_rules = _get_framework_rules(framework)
 
     # === ADD GAP-FOCUSED CONTEXT ===
     gap_context = ""
@@ -276,40 +327,172 @@ def build_prompt(kind: str, compact_json: str, focus_label: str, shard: int, tot
         if gap_context:
             print(f"   Added {len(gap_context)} chars of gap-focused context to prompt")
             print(f"   Targeting uncovered code lines")
-            # Show first 500 chars for verification
             print(f"   Preview: {gap_context[:500]}...")
+
+    # Framework-specific instructions to AVOID wrong patterns
+    anti_patterns = _get_anti_patterns(framework)
+
     user_content = f"""
-UNIVERSAL {kind.upper()} TEST GENERATION - FILE {shard + 1}/{total}
+{framework.upper()} {kind.upper()} TEST GENERATION - FILE {shard + 1}/{total}
+
+DETECTED FRAMEWORK: {framework.upper()}
 
 {dev_instructions}
 {merged_rules}
 
 {gap_context}
-DJANGO-SPECIFIC RULES (when Django is detected):
-- Use RequestFactory (not SimpleNamespace/DummyRequest) to build HttpRequest.
-- When setting request.POST/GET, use QueryDict (or helper) so .getlist works.
-- If tests touch models/querysets, mark tests with pytest.mark.django_db.
-- Prefer asserting substrings in response.content/HttpResponse, avoid strict equality to full HTML.
-- Do NOT set arbitrary .object_list lists unless you wrap them in a queryset-like with .order_by/.all.
 
-CRITICAL PARAMETRIZATION REQUIREMENTS:
-- Every name in @pytest.mark.parametrize MUST appear in the function signature.
+{anti_patterns}
 
-CRITICAL CALL-SAFETY REQUIREMENTS:
-- Never repeat the same keyword in a call (e.g., Mock(name=...) only once).
-- Generate syntactically valid Python.
+CRITICAL REQUIREMENTS:
+- Do NOT define fixtures that already exist in conftest.py (client, app, sample_data)
+- Do NOT create duplicate fixture definitions in test files
+- Every @pytest.mark.parametrize name MUST appear in the function signature
+- Never repeat the same keyword in a call (e.g., Mock(name=...) only once)
+- Generate syntactically valid Python
 
 FOCUS TARGETS: {focus_label}
 PROJECT ANALYSIS: {compact_json}
 ADDITIONAL CONTEXT (TRIMMED): {trimmed_context}
 
-{UNIVERSAL_SCAFFOLD}
+{_get_framework_scaffold(framework)}
 """.strip()
 
     return [
         {"role": "system", "content": SYSTEM_MIN_LOCAL},
         {"role": "user", "content": user_content},
     ]
+
+
+def _get_framework_rules(framework: str) -> str:
+    """Get framework-specific rules."""
+    base_rules = (
+        "UNIVERSAL REQUIREMENTS:\n"
+        "1) Use REAL imports and execution; no stubs.\n"
+        "2) Test success, failure, and edge cases (None/empty/invalid).\n"
+        "3) Multiple test methods per target; aim high coverage.\n"
+        "4) Only output runnable Python (no markdown).\n"
+        "5) @pytest.mark.parametrize: EVERY name listed MUST appear in the test "
+        "   function signature. Do NOT parametrize unused names.\n"
+    )
+
+    if framework == "flask":
+        return base_rules + (
+            "\nFLASK RULES:\n"
+            "- Use client fixture (Flask test client) - do NOT redefine it\n"
+            "- Use client.get(), client.post(), client.put(), client.delete()\n"
+            "- For JSON: client.post('/path', json={...})\n"
+            "- Check: response.status_code, response.get_json(), response.get_data(as_text=True)\n"
+            "- Do NOT use global state directly; rely on reset_app_state fixture\n"
+        )
+    elif framework == "django":
+        return base_rules + (
+            "\nDJANGO RULES:\n"
+            "- Use client fixture (Django test Client) - do NOT redefine it\n"
+            "- Use RequestFactory for unit testing views\n"
+            "- Use QueryDict for POST/GET data so .getlist works\n"
+            "- Mark DB tests with @pytest.mark.django_db\n"
+            "- Prefer substring assertions for HTML content\n"
+        )
+    elif framework == "fastapi":
+        return base_rules + (
+            "\nFASTAPI RULES:\n"
+            "- Use client fixture (TestClient) - do NOT redefine it\n"
+            "- Use client.get(), client.post(), etc.\n"
+            "- For JSON: client.post('/path', json={...})\n"
+            "- Check: response.status_code, response.json()\n"
+            "- For async: use pytest-asyncio markers\n"
+        )
+    else:
+        return base_rules
+
+
+def _get_anti_patterns(framework: str) -> str:
+    """Get instructions for what NOT to do based on framework."""
+    if framework == "flask":
+        return (
+            "FLASK ANTI-PATTERNS (DO NOT USE):\n"
+            "- Do NOT use @pytest.mark.django_db - this is Flask\n"
+            "- Do NOT use Django's RequestFactory or QueryDict\n"
+            "- Do NOT use Django's Client - use Flask's test_client()\n"
+            "- Do NOT import from django.* modules\n"
+            "- Do NOT define @pytest.fixture def client() - it's in conftest.py\n"
+        )
+    elif framework == "django":
+        return (
+            "DJANGO ANTI-PATTERNS (DO NOT USE):\n"
+            "- Do NOT use Flask's test_client()\n"
+            "- Do NOT import from flask.* modules\n"
+            "- Do NOT use FastAPI's TestClient\n"
+            "- Do NOT define @pytest.fixture def client() - it's in conftest.py\n"
+        )
+    elif framework == "fastapi":
+        return (
+            "FASTAPI ANTI-PATTERNS (DO NOT USE):\n"
+            "- Do NOT use @pytest.mark.django_db - this is FastAPI\n"
+            "- Do NOT use Django's RequestFactory or QueryDict\n"
+            "- Do NOT use Flask's test_client()\n"
+            "- Do NOT define @pytest.fixture def client() - it's in conftest.py\n"
+        )
+    else:
+        return ""
+
+
+def _get_framework_scaffold(framework: str) -> str:
+    """Get framework-specific test scaffold."""
+    if framework == "flask":
+        return '''
+# Flask test template - use existing fixtures from conftest.py
+import pytest
+
+def test_example_endpoint(client):
+    """Example Flask test using client fixture."""
+    response = client.get('/')
+    assert response.status_code == 200
+
+def test_example_json_api(client):
+    """Example Flask JSON API test."""
+    response = client.post('/api/endpoint', json={"key": "value"})
+    assert response.status_code in [200, 201]
+    data = response.get_json()
+    assert data is not None
+'''
+    elif framework == "django":
+        return '''
+# Django test template - use existing fixtures from conftest.py
+import pytest
+
+@pytest.mark.django_db
+def test_example_view(client):
+    """Example Django test using client fixture."""
+    response = client.get('/')
+    assert response.status_code == 200
+
+@pytest.mark.django_db
+def test_example_with_user(authenticated_client):
+    """Example Django test with authenticated user."""
+    response = authenticated_client.get('/profile/')
+    assert response.status_code == 200
+'''
+    elif framework == "fastapi":
+        return '''
+# FastAPI test template - use existing fixtures from conftest.py
+import pytest
+
+def test_example_endpoint(client):
+    """Example FastAPI test using client fixture."""
+    response = client.get('/')
+    assert response.status_code == 200
+
+def test_example_json_api(client):
+    """Example FastAPI JSON API test."""
+    response = client.post('/api/endpoint', json={"key": "value"})
+    assert response.status_code in [200, 201]
+    data = response.json()
+    assert data is not None
+'''
+    else:
+        return UNIVERSAL_SCAFFOLD
 
 
 

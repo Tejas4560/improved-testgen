@@ -438,10 +438,225 @@ def extract_python_only(text: str) -> str:
             return "\n\n".join(blocks)
         return text.replace("```","")
     return text
+
+
 def validate_code(code: str):
-        if not code.strip(): return False, "empty output"
-        if not re.search(r"def test_", code): return False, "no test functions"
-        try: ast.parse(code); return True, ""
-        except SyntaxError as e: return False, f"syntax error: {e}"
-    
+    if not code.strip(): return False, "empty output"
+    if not re.search(r"def test_", code): return False, "no test functions"
+    try: ast.parse(code); return True, ""
+    except SyntaxError as e: return False, f"syntax error: {e}"
+
+
 def massage(code: str): return code
+
+
+# ============== FIXTURE DEDUPLICATION ==============
+
+# Fixtures that should NOT be defined in test files (they're in conftest.py)
+CONFTEST_FIXTURES = {
+    'client', 'app', 'sample_data', 'auth_headers', 'user', 'admin_user',
+    'authenticated_client', 'rf', 'rf_with_session', 'mock_request',
+    'authenticated_user', 'event_loop', 'async_client', 'mock_db',
+    'reset_app_state', 'api_client', 'db'
+}
+
+
+def remove_duplicate_fixtures(code: str, framework: str = "universal") -> str:
+    """
+    Remove duplicate fixture definitions that exist in conftest.py.
+
+    Args:
+        code: The generated test code
+        framework: The detected framework
+
+    Returns:
+        Code with duplicate fixtures removed
+    """
+    lines = code.split('\n')
+    result_lines = []
+    skip_until_next_def = False
+    current_indent = 0
+    fixture_being_skipped = None
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Check if we're in skip mode
+        if skip_until_next_def:
+            # Check if this line starts a new top-level definition
+            stripped = line.strip()
+            if stripped and not line.startswith(' ') and not line.startswith('\t'):
+                # New top-level statement, stop skipping
+                skip_until_next_def = False
+                fixture_being_skipped = None
+            elif line.strip().startswith('@') and not line.startswith(' '):
+                # New decorator at top level, stop skipping
+                skip_until_next_def = False
+                fixture_being_skipped = None
+            else:
+                # Still inside the fixture being skipped
+                i += 1
+                continue
+
+        # Check if this is a fixture decorator followed by a function we should skip
+        if line.strip().startswith('@pytest.fixture'):
+            # Look ahead to find the function name
+            j = i + 1
+            while j < len(lines) and (lines[j].strip().startswith('@') or not lines[j].strip()):
+                j += 1
+
+            if j < len(lines):
+                func_match = re.match(r'def\s+(\w+)\s*\(', lines[j].strip())
+                if func_match:
+                    func_name = func_match.group(1)
+                    if func_name in CONFTEST_FIXTURES:
+                        # Skip this fixture - it's in conftest.py
+                        print(f"   Removing duplicate fixture: {func_name}")
+                        skip_until_next_def = True
+                        fixture_being_skipped = func_name
+                        i += 1
+                        continue
+
+        result_lines.append(line)
+        i += 1
+
+    return '\n'.join(result_lines)
+
+
+def remove_wrong_framework_markers(code: str, framework: str) -> str:
+    """
+    Remove markers/imports from wrong frameworks.
+
+    Args:
+        code: The generated test code
+        framework: The detected framework
+
+    Returns:
+        Code with wrong framework artifacts removed
+    """
+    if framework == "flask":
+        # Remove Django markers from Flask tests
+        code = re.sub(r'@pytest\.mark\.django_db(?:\([^)]*\))?\s*\n', '', code)
+        # Remove Django imports
+        code = re.sub(r'from django\.[^\n]+\n', '', code)
+        code = re.sub(r'import django[^\n]*\n', '', code)
+
+    elif framework == "fastapi":
+        # Remove Django markers from FastAPI tests
+        code = re.sub(r'@pytest\.mark\.django_db(?:\([^)]*\))?\s*\n', '', code)
+        # Remove Django imports
+        code = re.sub(r'from django\.[^\n]+\n', '', code)
+        code = re.sub(r'import django[^\n]*\n', '', code)
+        # Remove Flask imports
+        code = re.sub(r'from flask[^\n]+\n', '', code)
+        code = re.sub(r'import flask[^\n]*\n', '', code)
+
+    elif framework == "django":
+        # Remove Flask imports from Django tests
+        code = re.sub(r'from flask[^\n]+\n', '', code)
+        code = re.sub(r'import flask[^\n]*\n', '', code)
+        # Remove FastAPI imports
+        code = re.sub(r'from fastapi[^\n]+\n', '', code)
+        code = re.sub(r'import fastapi[^\n]*\n', '', code)
+
+    return code
+
+
+def fix_global_state_patterns(code: str) -> str:
+    """
+    Fix incorrect global state patterns in generated code.
+
+    Replaces patterns like:
+        global tasks
+        tasks = [...]
+
+    With correct patterns like:
+        from app import tasks
+        tasks.clear()
+        tasks.extend([...])
+    """
+    # Pattern: global varname followed by assignment
+    pattern = r'global\s+(\w+)\s*\n\s*\1\s*=\s*\[(.*?)\]'
+
+    def replace_global_pattern(match):
+        var_name = match.group(1)
+        # Return a comment explaining the issue
+        return f"# Note: Use {var_name}.clear() and {var_name}.extend([...]) instead of reassignment\n    # from app import {var_name}\n    # {var_name}.clear()"
+
+    code = re.sub(pattern, replace_global_pattern, code, flags=re.DOTALL)
+    return code
+
+
+def cleanup_generated_test(code: str, framework: str = "universal") -> str:
+    """
+    Apply all cleanup operations to generated test code.
+
+    Args:
+        code: The generated test code
+        framework: The detected framework
+
+    Returns:
+        Cleaned up code
+    """
+    # Remove duplicate fixtures
+    code = remove_duplicate_fixtures(code, framework)
+
+    # Remove wrong framework markers
+    code = remove_wrong_framework_markers(code, framework)
+
+    # Fix global state patterns
+    code = fix_global_state_patterns(code)
+
+    # Remove excessive blank lines
+    code = re.sub(r'\n{4,}', '\n\n\n', code)
+
+    # Remove any remaining markdown artifacts
+    code = re.sub(r'^```python\s*\n', '', code)
+    code = re.sub(r'^```\s*\n', '', code)
+    code = re.sub(r'\n```\s*$', '', code)
+
+    return code
+
+
+def postprocess_test_file(file_path: pathlib.Path, framework: str = "universal") -> bool:
+    """
+    Post-process a generated test file to clean up issues.
+
+    Args:
+        file_path: Path to the test file
+        framework: The detected framework
+
+    Returns:
+        True if file was modified, False otherwise
+    """
+    try:
+        original_content = file_path.read_text(encoding='utf-8')
+        cleaned_content = cleanup_generated_test(original_content, framework)
+
+        if cleaned_content != original_content:
+            file_path.write_text(cleaned_content, encoding='utf-8')
+            print(f"   Post-processed: {file_path.name}")
+            return True
+        return False
+    except Exception as e:
+        print(f"   Error post-processing {file_path}: {e}")
+        return False
+
+
+def postprocess_all_tests(output_dir: pathlib.Path, framework: str = "universal") -> int:
+    """
+    Post-process all generated test files in a directory.
+
+    Args:
+        output_dir: Directory containing generated tests
+        framework: The detected framework
+
+    Returns:
+        Number of files modified
+    """
+    modified_count = 0
+    for test_file in output_dir.glob("test_*.py"):
+        if postprocess_test_file(test_file, framework):
+            modified_count += 1
+    return modified_count

@@ -46,13 +46,65 @@ except Exception as _e:
     
     def massage(code: str): return code
 
-def _create_universal_conftest(outdir: pathlib.Path, target_root: pathlib.Path) -> str:
-    """Create universal conftest.py for any project structure."""
+def _detect_framework(analysis: Dict[str, Any], target_root: pathlib.Path) -> str:
+    """Detect the framework from analysis or by inspecting the target directory."""
+    # Check if framework is already in analysis
+    if "framework" in analysis:
+        return analysis["framework"].lower()
+
+    # Check imports for framework detection
+    imports = analysis.get("imports", [])
+    import_names = set()
+    for imp in imports:
+        if isinstance(imp, dict):
+            import_names.add(imp.get("module", "").lower())
+            import_names.add(imp.get("name", "").lower())
+        elif isinstance(imp, str):
+            import_names.add(imp.lower())
+
+    # Check for Flask
+    if any("flask" in i for i in import_names):
+        return "flask"
+
+    # Check for Django
+    if any("django" in i for i in import_names):
+        return "django"
+
+    # Check for FastAPI
+    if any("fastapi" in i for i in import_names):
+        return "fastapi"
+
+    # Check files in target directory
+    try:
+        for py_file in target_root.glob("**/*.py"):
+            if "venv" in str(py_file) or "site-packages" in str(py_file):
+                continue
+            try:
+                content = py_file.read_text(encoding='utf-8', errors='ignore')
+                if "from flask" in content or "import flask" in content:
+                    return "flask"
+                if "from django" in content or "import django" in content:
+                    return "django"
+                if "from fastapi" in content or "import fastapi" in content:
+                    return "fastapi"
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return "universal"
+
+
+def _create_universal_conftest(outdir: pathlib.Path, target_root: pathlib.Path,
+                                framework: str = "universal") -> str:
+    """Create framework-specific conftest.py."""
     from .conftest_text import conftest_text
     from .writer import write_text
-    
+
     conftest_path = outdir / "conftest.py"
-    base_conftest = conftest_text()
+
+    # Generate framework-specific conftest
+    base_conftest = conftest_text(framework=framework, target_root=str(target_root))
     
     # Enhanced universal conftest
     universal_conftest = base_conftest + f'''
@@ -586,14 +638,15 @@ def _sanitize_parametrize_signature_mismatches(code: str) -> str:
 
 def generate_all(analysis: Dict[str, Any], outdir: str = "tests/generated",
                 focus_files: Optional[List[str]] = None):
-    """Generate UNIVERSAL test suite for any project structure."""
+    """Generate framework-aware test suite for any project structure."""
     from .enhanced_analysis_utils import (compact_analysis, enhance_coverage_targeting,
-                                          filter_by_files, infer_required_packages, 
+                                          filter_by_files, infer_required_packages,
                                           pip_install, prune_unavailable_targets)
     from .enhanced_prompt import build_prompt, files_per_kind, focus_for
     from .writer import update_manifest, write_text
-    
-    print("UNIVERSAL test generation for ANY PROJECT STRUCTURE...")
+    from .postprocess import cleanup_generated_test, postprocess_all_tests
+
+    print("FRAMEWORK-AWARE test generation...")
     
     # Export full code AST (before any filtering)
     try:
@@ -631,13 +684,18 @@ def generate_all(analysis: Dict[str, Any], outdir: str = "tests/generated",
     target_root = pathlib.Path(os.environ.get("TARGET_ROOT", "target"))
     if not target_root.exists():
         raise RuntimeError(f"Target directory not found: {target_root}")
-    
-    # UNIVERSAL: Ensure target root is in Python path
+
+    # Ensure target root is in Python path
     if str(target_root) not in sys.path:
         sys.path.insert(0, str(target_root))
-    
-    conftest_path = _create_universal_conftest(output_dir, target_root)
-    print(f"Created universal conftest: {conftest_path}")
+
+    # DETECT FRAMEWORK for framework-aware generation
+    detected_framework = _detect_framework(analysis, target_root)
+    print(f"Detected framework: {detected_framework.upper()}")
+
+    # Create framework-specific conftest
+    conftest_path = _create_universal_conftest(output_dir, target_root, detected_framework)
+    print(f"Created {detected_framework} conftest: {conftest_path}")
     
     # Simple change detection - always generate tests
     changed_files = set()
@@ -701,32 +759,36 @@ def generate_all(analysis: Dict[str, Any], outdir: str = "tests/generated",
         if num_files <= 0:
             continue
         
-        print(f"Generating {num_files} {test_kind.upper()} test files for universal compatibility...")
-        
+        print(f"Generating {num_files} {test_kind.upper()} test files for {detected_framework.upper()}...")
+
         for file_index in range(num_files):
             try:
                 focus_label, focus_names, shard_targets = focus_for(compact, test_kind, file_index, num_files)
-                
+
                 if not focus_names:
                     continue
-                
+
                 print(f"Generating {test_kind} test {file_index + 1}/{num_files} for {len(focus_names)} targets")
-                
+
                 context = _gather_universal_context(target_root, filtered_analysis, focus_names)
-                
-                prompt_messages = build_prompt(test_kind, compact_json, focus_label, 
-                                              file_index, num_files, compact, context)
-                
+
+                # Pass detected framework to prompt builder
+                prompt_messages = build_prompt(test_kind, compact_json, focus_label,
+                                              file_index, num_files, compact, context,
+                                              framework=detected_framework)
+
                 test_code = _generate_with_universal_retry(prompt_messages, max_attempts=3)
-                
-                # UNIVERSAL: Fix imports for any project structure
+
+                # Fix imports for project structure
                 test_code = _fix_imports_for_universal_compatibility(test_code, target_root, analysis)
-                # NEW: sanitize parametrization mismatches automatically
+                # Sanitize parametrization mismatches
                 test_code = _sanitize_parametrize_signature_mismatches(test_code)
-                
+                # Clean up framework-specific issues (duplicate fixtures, wrong markers)
+                test_code = cleanup_generated_test(test_code, detected_framework)
+
                 filename = f"test_{test_kind}_{timestamp}_{file_index + 1:02d}.py"
                 file_path = output_dir / filename
-                
+
                 write_text(file_path, test_code)
                 generated_files.append(str(file_path))
                 print(f"  {filename} - {len(focus_names)} targets")
@@ -735,24 +797,33 @@ def generate_all(analysis: Dict[str, Any], outdir: str = "tests/generated",
                 print(f"Error generating {test_kind} test {file_index + 1}: {e}")
                 traceback.print_exc()
     
+    # Final post-processing pass on all generated files
+    if generated_files:
+        print(f"\nPost-processing {len(generated_files)} generated test files...")
+        modified_count = postprocess_all_tests(output_dir, detected_framework)
+        if modified_count > 0:
+            print(f"  Post-processed {modified_count} files (removed duplicates/wrong markers)")
+
     change_summary = {
         "added_or_modified": len(changed_files),
         "deleted": len(deleted_files),
         "total_analyzed": len(changed_files) + len(deleted_files),
         "coverage_target": "Maximum",
-        "universal_compatibility": True,
+        "detected_framework": detected_framework,
         "project_structure": analysis.get("project_structure", {}).get("package_names", [])
     }
     from .writer import update_manifest  # re-import here to be safe
     update_manifest(output_dir, generated_files, change_summary)
-    
+
     if generated_files:
-        print(f"UNIVERSAL GENERATION COMPLETE: {len(generated_files)} test files")
-        print(f"Expected Coverage: Maximum with REAL IMPORTS")
-        print(f"Universal Compatibility: ENABLED")
-        print(f"Targets Covered: {total_targets}")
-        print(f"Project Structure: {len(analysis.get('project_structure', {}).get('package_names', []))} packages detected")
-    
+        print(f"\n{'='*50}")
+        print(f"GENERATION COMPLETE: {len(generated_files)} test files")
+        print(f"{'='*50}")
+        print(f"  Framework: {detected_framework.upper()}")
+        print(f"  Targets Covered: {total_targets}")
+        print(f"  Coverage Target: Maximum with REAL IMPORTS")
+        print(f"{'='*50}")
+
     return generated_files
 
 def _validate_and_fix_test_code(code: str, filename: str) -> str:
