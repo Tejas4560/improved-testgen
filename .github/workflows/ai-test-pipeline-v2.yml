@@ -33,6 +33,16 @@ on:
         required: false
         default: ''
         type: string
+      auto_push_tests:
+        description: 'Auto-push generated tests to a dedicated branch'
+        required: false
+        default: 'false'
+        type: string
+      tests_branch:
+        description: 'Branch name for generated tests (default: ai-generated-tests)'
+        required: false
+        default: 'ai-generated-tests'
+        type: string
 
   workflow_call:
     inputs:
@@ -65,6 +75,16 @@ on:
         description: 'SonarQube Project Key'
         required: false
         default: ''
+        type: string
+      auto_push_tests:
+        description: 'Auto-push generated tests to a dedicated branch'
+        required: false
+        default: 'false'
+        type: string
+      tests_branch:
+        description: 'Branch name for generated tests'
+        required: false
+        default: 'ai-generated-tests'
         type: string
 
     secrets:
@@ -114,6 +134,9 @@ on:
       delta_passed:
         description: 'Whether delta threshold was met'
         value: ${{ jobs.test-generation.outputs.delta_passed }}
+      tests_branch_url:
+        description: 'URL of the branch containing generated tests'
+        value: ${{ jobs.test-generation.outputs.tests_branch_url }}
 
   pull_request:
     branches: [main, master]
@@ -150,6 +173,7 @@ jobs:
       coverage_report_url: ${{ steps.deploy-pages.outputs.pages_url }}
       threshold_passed: ${{ steps.metrics.outputs.threshold_passed }}
       delta_passed: ${{ steps.metrics.outputs.delta_passed }}
+      tests_branch_url: ${{ steps.push-tests.outputs.tests_branch_url }}
 
     steps:
       - name: Checkout Pipeline Repository
@@ -407,6 +431,102 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Push Generated Tests to Consumer Repository
+        id: push-tests
+        if: inputs.auto_push_tests == 'true'
+        env:
+          GIT_PUSH_TOKEN: ${{ secrets.GIT_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          cd ${{ github.workspace }}/pipeline
+
+          # Check if there are generated tests
+          if [ ! -d "tests/generated" ] || [ -z "$(ls -A tests/generated 2>/dev/null)" ]; then
+            echo "No generated tests to push"
+            echo "tests_pushed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          GENERATED_COUNT=$(find tests/generated -name "test_*.py" -type f | wc -l)
+          echo "Found $GENERATED_COUNT generated test files to push"
+
+          # Get repository info
+          REPO_URL="${{ steps.detect-repo.outputs.repo_url }}"
+          SOURCE_BRANCH="${{ steps.detect-repo.outputs.repo_branch }}"
+          TESTS_BRANCH="${{ inputs.tests_branch || 'ai-generated-tests' }}"
+
+          # Convert HTTPS URL to authenticated URL
+          # Handle both https://github.com/user/repo.git and https://github.com/user/repo formats
+          AUTH_URL=$(echo "$REPO_URL" | sed "s|https://|https://x-access-token:${GIT_PUSH_TOKEN}@|")
+
+          echo "Repository: $REPO_URL"
+          echo "Source branch: $SOURCE_BRANCH"
+          echo "Tests branch: $TESTS_BRANCH"
+
+          # Configure git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Clone consumer repo for pushing tests
+          cd ${{ github.workspace }}
+          rm -rf consumer-push-repo
+
+          # Check if tests branch already exists
+          if git ls-remote --heads "$REPO_URL" "$TESTS_BRANCH" | grep -q "$TESTS_BRANCH"; then
+            echo "Tests branch '$TESTS_BRANCH' exists, will update it"
+            git clone --branch "$TESTS_BRANCH" "$AUTH_URL" consumer-push-repo
+            cd consumer-push-repo
+
+            # Reset to source branch to ensure diff shows only generated tests
+            git fetch origin "$SOURCE_BRANCH"
+            git reset --hard "origin/$SOURCE_BRANCH"
+          else
+            echo "Tests branch '$TESTS_BRANCH' does not exist, will create it from '$SOURCE_BRANCH'"
+            git clone --branch "$SOURCE_BRANCH" "$AUTH_URL" consumer-push-repo
+            cd consumer-push-repo
+            git checkout -b "$TESTS_BRANCH"
+          fi
+
+          # Create tests/generated directory and copy generated tests
+          mkdir -p tests/generated
+          cp -r ${{ github.workspace }}/pipeline/tests/generated/* tests/generated/
+
+          # Check if there are changes
+          git add tests/generated/
+
+          if git diff --staged --quiet; then
+            echo "No new changes to push"
+            echo "tests_pushed=false" >> $GITHUB_OUTPUT
+          else
+            # Commit with simple message (coverage details in commit body via -m flags)
+            git commit \
+              -m "AI Generated Tests - Run #${{ github.run_number }}" \
+              -m "Coverage: ${{ steps.metrics.outputs.coverage_after }}% | Tests: ${GENERATED_COUNT} files | Delta: ${{ steps.metrics.outputs.coverage_delta }} pp" \
+              -m "Generated by AI Test Generation Pipeline" \
+              -m "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+            git push origin "$TESTS_BRANCH" --force
+
+            echo "tests_pushed=true" >> $GITHUB_OUTPUT
+            echo "Generated tests pushed to branch: $TESTS_BRANCH"
+          fi
+
+          # Generate branch URL for output
+          # Convert git URL to browser URL
+          BROWSER_URL=$(echo "$REPO_URL" | sed 's/\.git$//')
+          BRANCH_URL="${BROWSER_URL}/tree/${TESTS_BRANCH}"
+          COMPARE_URL="${BROWSER_URL}/compare/${SOURCE_BRANCH}...${TESTS_BRANCH}"
+
+          echo "tests_branch_url=$BRANCH_URL" >> $GITHUB_OUTPUT
+          echo "compare_url=$COMPARE_URL" >> $GITHUB_OUTPUT
+          echo ""
+          echo "========================================"
+          echo "  Generated Tests Branch"
+          echo "========================================"
+          echo "  Branch: $TESTS_BRANCH"
+          echo "  View:   $BRANCH_URL"
+          echo "  Diff:   $COMPARE_URL"
+          echo "========================================"
+
       - name: Deploy Coverage to GitHub Pages
         id: deploy-pages
         if: always()
@@ -508,6 +628,25 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Add Generated Tests Branch section if auto-push was enabled
+          if [ "${{ inputs.auto_push_tests }}" = "true" ]; then
+            echo "## Generated Tests Branch" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.push-tests.outputs.tests_pushed }}" = "true" ]; then
+              echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+              echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+              echo "| **Branch** | \`${{ inputs.tests_branch || 'ai-generated-tests' }}\` |" >> $GITHUB_STEP_SUMMARY
+              echo "| **Status** | Pushed |" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "[View Branch](${{ steps.push-tests.outputs.tests_branch_url }}) | [Compare with ${{ steps.detect-repo.outputs.repo_branch }}](${{ steps.push-tests.outputs.compare_url }})" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "No new tests were pushed (no changes or no tests generated)" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
           echo "## Artifacts" >> $GITHUB_STEP_SUMMARY
           echo "| Artifact | Description |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------------|" >> $GITHUB_STEP_SUMMARY
@@ -548,6 +687,8 @@ jobs:
             ### Links
             - [Coverage Report](${{ steps.deploy-pages.outputs.pages_url }})
             - [Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            ${{ inputs.auto_push_tests == 'true' && steps.push-tests.outputs.tests_pushed == 'true' && format('- [Generated Tests Branch]({0})', steps.push-tests.outputs.tests_branch_url) || '' }}
+            ${{ inputs.auto_push_tests == 'true' && steps.push-tests.outputs.tests_pushed == 'true' && format('- [Compare Changes]({0})', steps.push-tests.outputs.compare_url) || '' }}
 
             ---
             *Run #${{ github.run_number }}*
