@@ -966,7 +966,7 @@ jobs:
           fi
 
           # Also create a root index that redirects to latest run
-          cat > "gh-pages-deploy/index.html" << ROOT_EOF
+          cat > "index.html" << ROOT_EOF
           <!DOCTYPE html>
           <html>
           <head>
