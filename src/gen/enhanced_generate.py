@@ -96,9 +96,14 @@ def _detect_framework(analysis: Dict[str, Any], target_root: pathlib.Path) -> st
     has_python_files = False
     try:
         for py_file in target_root.glob("**/*.py"):
-            if "venv" in str(py_file) or "site-packages" in str(py_file):
+            py_str = str(py_file)
+            # Skip non-project directories (venv, node_modules, etc.)
+            if any(skip in py_str for skip in [
+                "venv", "site-packages", "node_modules", ".venv",
+                "__pycache__", ".git", "frontend", "dist", "build"
+            ]):
                 continue
-            if "test" in str(py_file).lower():
+            if "test" in py_str.lower():
                 continue  # Skip test files
 
             has_python_files = True
@@ -161,9 +166,13 @@ def _get_source_to_test_mapping(target_root: pathlib.Path, analysis: Dict[str, A
 
     try:
         for py_file in target_root.glob("**/*.py"):
-            if "venv" in str(py_file) or "site-packages" in str(py_file):
+            py_str = str(py_file)
+            if any(skip in py_str for skip in [
+                "venv", "site-packages", "node_modules", ".venv",
+                "__pycache__", ".git", "frontend", "dist", "build"
+            ]):
                 continue
-            if "test" in str(py_file).lower():
+            if "test" in py_str.lower():
                 continue
             if py_file.name.startswith("_"):
                 continue  # Skip private modules

@@ -19,13 +19,70 @@ echo ""
 # Set directory paths
 export CURRENT_DIR="$(pwd)"
 export TARGET_DIR="$(pwd)/target_repo"
-export TARGET_ROOT="$TARGET_DIR"
-export PYTHONPATH="$TARGET_DIR"
 export PATH="$CURRENT_DIR/venv/sonar-scanner/bin:$PATH"
 
 echo "Pipeline Directory: $CURRENT_DIR"
 echo "Target Repository: $TARGET_DIR"
 echo ""
+
+# ===== AUTO-DETECT PYTHON BACKEND ROOT =====
+# For fullstack repos (frontend + backend), find where the Python code lives.
+# Searches for requirements.txt or setup.py in common backend subdirectories.
+# Falls back to repo root for pure Python projects.
+
+detect_python_root() {
+  local repo_root="$1"
+
+  # 1. Check repo root first (pure Python project)
+  if [ -f "$repo_root/requirements.txt" ] || [ -f "$repo_root/setup.py" ] || [ -f "$repo_root/pyproject.toml" ]; then
+    echo "$repo_root"
+    return
+  fi
+
+  # 2. Check common backend subdirectory names
+  for subdir in backend server api app src python py-backend back-end service; do
+    if [ -d "$repo_root/$subdir" ]; then
+      if [ -f "$repo_root/$subdir/requirements.txt" ] || \
+         [ -f "$repo_root/$subdir/setup.py" ] || \
+         [ -f "$repo_root/$subdir/pyproject.toml" ]; then
+        echo "$repo_root/$subdir"
+        return
+      fi
+    fi
+  done
+
+  # 3. Search for requirements.txt up to 2 levels deep (excluding node_modules, venv, frontend)
+  local found
+  found=$(find "$repo_root" -maxdepth 2 -name "requirements.txt" \
+    -not -path "*/node_modules/*" \
+    -not -path "*/venv/*" \
+    -not -path "*/.venv/*" \
+    -not -path "*/frontend/*" \
+    -not -path "*/.git/*" \
+    2>/dev/null | head -1)
+
+  if [ -n "$found" ]; then
+    dirname "$found"
+    return
+  fi
+
+  # 4. Fallback: repo root
+  echo "$repo_root"
+}
+
+PYTHON_ROOT=$(detect_python_root "$TARGET_DIR")
+export TARGET_ROOT="$PYTHON_ROOT"
+export PYTHONPATH="$PYTHON_ROOT"
+
+if [ "$PYTHON_ROOT" != "$TARGET_DIR" ]; then
+  echo "Fullstack project detected!"
+  echo "  Repo root:    $TARGET_DIR"
+  echo "  Python root:  $PYTHON_ROOT"
+  echo ""
+else
+  echo "Python project root: $TARGET_DIR"
+  echo ""
+fi
 
 check_final_coverage() {
     MIN_COVERAGE="${MIN_COVERAGE_THRESHOLD:-90}"
@@ -135,15 +192,21 @@ PYCODE
 )
 
   # Install project dependencies if requirements.txt exists
-  if [ -f "$TARGET_DIR/requirements.txt" ]; then
-    echo "Installing project dependencies from target repo..."
+  if [ -f "$PYTHON_ROOT/requirements.txt" ]; then
+    echo "Installing project dependencies from: $PYTHON_ROOT/requirements.txt"
+    if ! pip install -q -r "$PYTHON_ROOT/requirements.txt"; then
+      echo "Error: Failed to install project dependencies"
+      exit 1
+    fi
+  elif [ -f "$TARGET_DIR/requirements.txt" ]; then
+    echo "Installing project dependencies from target repo root..."
     if ! pip install -q -r "$TARGET_DIR/requirements.txt"; then
       echo "Error: Failed to install project dependencies"
       exit 1
     fi
   else
-    echo "No requirements.txt found in target repo"
-    exit 1
+    echo "Warning: No requirements.txt found (checked $PYTHON_ROOT and $TARGET_DIR)"
+    echo "Continuing without installing dependencies..."
   fi
   echo ""
 
@@ -215,7 +278,7 @@ PYCODE
 
   MANUAL_TEST_EXIT_CODE=0
   if pytest "$CURRENT_DIR/tests/manual" \
-    --cov="$TARGET_DIR" \
+    --cov="$PYTHON_ROOT" \
     --cov-config=pytest.ini \
     --cov-report=term-missing \
     --cov-report=xml \
@@ -240,14 +303,14 @@ PYCODE
     echo ""
     if ! python run_auto_fixer.py \
       --test-dir "$CURRENT_DIR/tests/manual" \
-      --project-root "$TARGET_DIR" \
+      --project-root "$PYTHON_ROOT" \
       --max-iterations 3; then
       echo "Warning: Auto-fixer had issues, but continuing..."
     fi
     echo ""
     echo "Re-running manual tests after auto-fix..."
     if pytest "$CURRENT_DIR/tests/manual" \
-      --cov="$TARGET_DIR" \
+      --cov="$PYTHON_ROOT" \
       --cov-config=pytest.ini \
       --cov-report=term-missing \
       --cov-report=xml \
@@ -351,7 +414,7 @@ PYCODE
   # Analyze Coverage Gaps
   echo "Analyzing coverage gaps..."
   if ! python src/coverage_gap_analyzer.py \
-    --target "$TARGET_DIR" \
+    --target "$PYTHON_ROOT" \
     --current-dir "$CURRENT_DIR" \
     --output coverage_gaps.json; then
     echo "Warning: Coverage gap analysis failed, but continuing..."
@@ -377,7 +440,7 @@ PYCODE
   echo "Starting gap-based AI test generation (timeout: ${TOTAL_TIMEOUT}s)..."
   if ! timeout --signal=SIGTERM --kill-after=30 "$TOTAL_TIMEOUT" \
     python multi_iteration_orchestrator.py \
-    --target "$TARGET_DIR" \
+    --target "$PYTHON_ROOT" \
     --iterations 3 \
     --target-coverage "$MIN_COVERAGE" \
     --outdir "$CURRENT_DIR/tests/generated"; then
@@ -417,7 +480,7 @@ PYCODE
     echo "Running combined test suite..."
     COMBINED_TEST_EXIT_CODE=0
     if pytest "$CURRENT_DIR/tests/manual" "$CURRENT_DIR/tests/generated" \
-      --cov="$TARGET_DIR" \
+      --cov="$PYTHON_ROOT" \
       --cov-config=pytest.ini \
       --cov-report=term-missing \
       --cov-report=xml \
@@ -443,7 +506,7 @@ PYCODE
 
       if ! python run_auto_fixer.py \
         --test-dir "$CURRENT_DIR/tests/generated" \
-        --project-root "$TARGET_DIR" \
+        --project-root "$PYTHON_ROOT" \
         --max-iterations 3; then
         echo "Warning: Auto-fixer had issues, but continuing..."
       fi
@@ -451,7 +514,7 @@ PYCODE
       echo ""
       echo "Re-running tests after auto-fix..."
       if ! pytest "$CURRENT_DIR/tests/manual" "$CURRENT_DIR/tests/generated" \
-        --cov="$TARGET_DIR" \
+        --cov="$PYTHON_ROOT" \
         --cov-config=pytest.ini \
         --cov-report=term-missing \
         --cov-report=xml \
@@ -596,15 +659,21 @@ export TESTGEN_FORCE=true
 rm -rf "./tests/generated"
 
 # Install target dependencies
-if [ -f "$TARGET_DIR/requirements.txt" ]; then
-  echo "Installing project dependencies from target repo..."
+if [ -f "$PYTHON_ROOT/requirements.txt" ]; then
+  echo "Installing project dependencies from: $PYTHON_ROOT/requirements.txt"
+  if ! pip install -q -r "$PYTHON_ROOT/requirements.txt"; then
+    echo "Error: Failed to install project dependencies"
+    exit 1
+  fi
+elif [ -f "$TARGET_DIR/requirements.txt" ]; then
+  echo "Installing project dependencies from target repo root..."
   if ! pip install -q -r "$TARGET_DIR/requirements.txt"; then
     echo "Error: Failed to install project dependencies"
     exit 1
   fi
 else
-  echo "No requirements.txt found in target repo"
-  exit 1
+  echo "Warning: No requirements.txt found (checked $PYTHON_ROOT and $TARGET_DIR)"
+  echo "Continuing without installing dependencies..."
 fi
 
 # Set timeout for AI generation (default 10 minutes)
@@ -612,7 +681,7 @@ GENERATION_TIMEOUT=${GENERATION_TIMEOUT:-600}
 
 echo "Generating AI tests (timeout: ${GENERATION_TIMEOUT}s)..."
 if ! timeout --signal=SIGTERM --kill-after=30 "$GENERATION_TIMEOUT" \
-  python -m src.gen --target "$TARGET_DIR" --outdir "$CURRENT_DIR/tests/generated" --force; then
+  python -m src.gen --target "$PYTHON_ROOT" --outdir "$CURRENT_DIR/tests/generated" --force; then
   EXIT_CODE=$?
   if [ $EXIT_CODE -eq 124 ]; then
     echo "Error: AI test generation timed out after ${GENERATION_TIMEOUT}s"
@@ -637,7 +706,7 @@ if [ "$TEST_COUNT" -gt 0 ]; then
   echo "Running pytest on AI-generated tests..."
   AI_TEST_EXIT_CODE=0
   if pytest "$CURRENT_DIR/tests/generated" \
-    --cov="$TARGET_DIR" \
+    --cov="$PYTHON_ROOT" \
     --cov-config=pytest.ini \
     --cov-report=term-missing \
     --cov-report=xml \
@@ -662,7 +731,7 @@ if [ "$TEST_COUNT" -gt 0 ]; then
 
     if ! python run_auto_fixer.py \
       --test-dir "$CURRENT_DIR/tests/generated" \
-      --project-root "$TARGET_DIR" \
+      --project-root "$PYTHON_ROOT" \
       --max-iterations 3; then
       echo "Warning: Auto-fixer had issues, but continuing..."
     fi
@@ -670,7 +739,7 @@ if [ "$TEST_COUNT" -gt 0 ]; then
     echo ""
     echo "Re-running tests after auto-fix..."
     if ! pytest "$CURRENT_DIR/tests/generated" \
-      --cov="$TARGET_DIR" \
+      --cov="$PYTHON_ROOT" \
       --cov-config=pytest.ini \
       --cov-report=term-missing \
       --cov-report=xml \
