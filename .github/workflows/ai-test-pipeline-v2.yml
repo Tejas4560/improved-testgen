@@ -433,7 +433,7 @@ jobs:
 
       - name: Push Generated Tests to Consumer Repository
         id: push-tests
-        if: inputs.auto_push_tests == 'true'
+        if: inputs.auto_push_tests == 'true' && steps.metrics.outputs.threshold_passed == 'true'
         env:
           GIT_PUSH_TOKEN: ${{ secrets.GIT_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
@@ -540,6 +540,42 @@ jobs:
 
           echo "Deploying coverage report to GitHub Pages..."
 
+          # Collect metrics for the dashboard
+          COV_BEFORE="${{ steps.metrics.outputs.coverage_before }}"
+          COV_AFTER="${{ steps.metrics.outputs.coverage_after }}"
+          COV_DELTA="${{ steps.metrics.outputs.coverage_delta }}"
+          TESTS_GEN="${{ steps.metrics.outputs.tests_generated }}"
+          TESTS_PASS="${{ steps.metrics.outputs.tests_passed }}"
+          TESTS_FAIL="${{ steps.metrics.outputs.tests_failed }}"
+          TESTS_TOTAL="${{ steps.metrics.outputs.tests_total }}"
+          THRESHOLD_OK="${{ steps.metrics.outputs.threshold_passed }}"
+          REPO_NAME="${{ steps.detect-repo.outputs.repo_name }}"
+          BRANCH="${{ steps.detect-repo.outputs.repo_branch }}"
+          RUN_NUM="${{ github.run_number }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          COV_INT=$(python3 -c "print(int(float('$COV_AFTER')))" 2>/dev/null || echo "0")
+          PASS_RATE="0"
+          if [ "$TESTS_TOTAL" != "0" ]; then
+            PASS_RATE=$(python3 -c "print(f'{(int(\"$TESTS_PASS\") / int(\"$TESTS_TOTAL\")) * 100:.0f}')" 2>/dev/null || echo "0")
+          fi
+
+          # Determine coverage color
+          if [ "$COV_INT" -ge 90 ]; then COV_HUE="142"; COV_LABEL="Excellent"
+          elif [ "$COV_INT" -ge 70 ]; then COV_HUE="60"; COV_LABEL="Good"
+          elif [ "$COV_INT" -ge 50 ]; then COV_HUE="30"; COV_LABEL="Fair"
+          else COV_HUE="0"; COV_LABEL="Low"; fi
+
+          # Status banner
+          if [ "$THRESHOLD_OK" = "true" ]; then
+            STATUS_CLASS="status-passed"
+            STATUS_TEXT="Quality Gate Passed"
+          else
+            STATUS_CLASS="status-failed"
+            STATUS_TEXT="Quality Gate Not Met"
+          fi
+
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -549,34 +585,415 @@ jobs:
             cd gh-pages-deploy
             git init
             git checkout -b gh-pages
-            echo "# Coverage Reports" > README.md
             touch .nojekyll
             git add .
             git commit -m "Initialize gh-pages"
             cd ..
           }
 
-          REPORT_DIR="coverage/run-${{ github.run_number }}"
-          mkdir -p "gh-pages-deploy/$REPORT_DIR"
-          cp -r pipeline/htmlcov/* "gh-pages-deploy/$REPORT_DIR/"
+          REPORT_DIR="coverage/run-${RUN_NUM}"
+          mkdir -p "gh-pages-deploy/$REPORT_DIR/detail"
 
-          touch gh-pages-deploy/.nojekyll
+          # Copy raw htmlcov into detail/ subdirectory
+          cp -r pipeline/htmlcov/* "gh-pages-deploy/$REPORT_DIR/detail/"
 
+          # Generate professional dashboard index.html
+          cat > "gh-pages-deploy/$REPORT_DIR/index.html" << 'DASHBOARD_EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Coverage Report — REPO_PLACEHOLDER</title>
+            <style>
+              :root {
+                --primary: #1a73e8;
+                --success: #1e8e3e;
+                --danger: #d93025;
+                --warn: #f9ab00;
+                --bg: #f8f9fa;
+                --card: #ffffff;
+                --text: #202124;
+                --muted: #5f6368;
+                --border: #dadce0;
+                --cov-hue: COV_HUE_PLACEHOLDER;
+              }
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                background: var(--bg);
+                color: var(--text);
+                line-height: 1.6;
+              }
+              .header {
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+                color: white;
+                padding: 2rem 0;
+                text-align: center;
+              }
+              .header h1 { font-size: 1.8rem; font-weight: 600; margin-bottom: 0.25rem; }
+              .header p { opacity: 0.8; font-size: 0.95rem; }
+              .status-banner {
+                padding: 0.75rem;
+                text-align: center;
+                font-weight: 600;
+                font-size: 0.95rem;
+                letter-spacing: 0.5px;
+              }
+              .status-passed { background: var(--success); color: white; }
+              .status-failed { background: var(--danger); color: white; }
+              .container {
+                max-width: 1100px;
+                margin: 0 auto;
+                padding: 2rem 1.5rem;
+              }
+              .grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+                gap: 1.25rem;
+                margin-bottom: 2rem;
+              }
+              .card {
+                background: var(--card);
+                border-radius: 12px;
+                padding: 1.5rem;
+                border: 1px solid var(--border);
+                box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+                transition: box-shadow 0.2s;
+              }
+              .card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.12); }
+              .card-label {
+                font-size: 0.8rem;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                color: var(--muted);
+                margin-bottom: 0.5rem;
+              }
+              .card-value {
+                font-size: 2.2rem;
+                font-weight: 700;
+                line-height: 1.2;
+              }
+              .card-sub { font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem; }
+
+              /* Coverage ring */
+              .cov-ring-card { display: flex; align-items: center; gap: 1.5rem; }
+              .cov-ring {
+                position: relative;
+                width: 110px;
+                height: 110px;
+                flex-shrink: 0;
+              }
+              .cov-ring svg { transform: rotate(-90deg); }
+              .cov-ring-bg { fill: none; stroke: #e8eaed; stroke-width: 8; }
+              .cov-ring-fill {
+                fill: none;
+                stroke: hsl(var(--cov-hue), 70%, 45%);
+                stroke-width: 8;
+                stroke-linecap: round;
+                stroke-dasharray: 314;
+                stroke-dashoffset: RING_OFFSET_PLACEHOLDER;
+                transition: stroke-dashoffset 1s ease;
+              }
+              .cov-ring-text {
+                position: absolute;
+                top: 50%; left: 50%;
+                transform: translate(-50%, -50%);
+                font-size: 1.5rem;
+                font-weight: 700;
+                color: hsl(var(--cov-hue), 70%, 40%);
+              }
+              .cov-info { flex: 1; }
+              .cov-info .label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+              .cov-info .rating {
+                font-size: 1rem;
+                font-weight: 600;
+                color: hsl(var(--cov-hue), 70%, 40%);
+                margin-top: 0.25rem;
+              }
+
+              /* Delta badge */
+              .delta-positive { color: var(--success); }
+              .delta-negative { color: var(--danger); }
+              .delta-neutral { color: var(--muted); }
+
+              /* Progress bar */
+              .progress-bar {
+                width: 100%;
+                height: 8px;
+                background: #e8eaed;
+                border-radius: 4px;
+                margin-top: 0.75rem;
+                overflow: hidden;
+              }
+              .progress-fill {
+                height: 100%;
+                border-radius: 4px;
+                background: hsl(var(--cov-hue), 70%, 45%);
+                transition: width 1s ease;
+              }
+
+              /* Section */
+              .section-title {
+                font-size: 1.1rem;
+                font-weight: 600;
+                margin-bottom: 1rem;
+                padding-bottom: 0.5rem;
+                border-bottom: 2px solid var(--border);
+              }
+
+              /* CTA button */
+              .btn {
+                display: inline-block;
+                padding: 0.75rem 1.5rem;
+                border-radius: 8px;
+                text-decoration: none;
+                font-weight: 600;
+                font-size: 0.95rem;
+                transition: all 0.2s;
+              }
+              .btn-primary { background: var(--primary); color: white; }
+              .btn-primary:hover { background: #1557b0; transform: translateY(-1px); }
+              .btn-outline {
+                background: transparent;
+                color: var(--primary);
+                border: 2px solid var(--primary);
+              }
+              .btn-outline:hover { background: var(--primary); color: white; }
+              .btn-group { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 1.5rem; }
+
+              /* Meta bar */
+              .meta-bar {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 0.5rem;
+                padding: 1rem 0;
+                margin-top: 2rem;
+                border-top: 1px solid var(--border);
+                font-size: 0.8rem;
+                color: var(--muted);
+              }
+
+              /* Table styling */
+              .quality-table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; }
+              .quality-table th, .quality-table td {
+                padding: 0.6rem 1rem;
+                text-align: left;
+                border-bottom: 1px solid var(--border);
+              }
+              .quality-table th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
+              .badge {
+                display: inline-block;
+                padding: 0.15rem 0.6rem;
+                border-radius: 12px;
+                font-size: 0.75rem;
+                font-weight: 600;
+              }
+              .badge-pass { background: #e6f4ea; color: var(--success); }
+              .badge-fail { background: #fce8e6; color: var(--danger); }
+
+              @media (max-width: 600px) {
+                .container { padding: 1rem; }
+                .grid { grid-template-columns: 1fr 1fr; }
+                .cov-ring-card { flex-direction: column; text-align: center; }
+              }
+            </style>
+          </head>
+          <body>
+            <div class="header">
+              <h1>Coverage Report</h1>
+              <p>REPO_PLACEHOLDER &mdash; BRANCH_PLACEHOLDER &mdash; Run #RUN_NUM_PLACEHOLDER</p>
+            </div>
+
+            <div class="STATUS_CLASS_PLACEHOLDER">STATUS_TEXT_PLACEHOLDER</div>
+
+            <div class="container">
+              <!-- Coverage Overview -->
+              <div class="grid">
+                <div class="card cov-ring-card" style="grid-column: span 2;">
+                  <div class="cov-ring">
+                    <svg width="110" height="110" viewBox="0 0 110 110">
+                      <circle class="cov-ring-bg" cx="55" cy="55" r="50"/>
+                      <circle class="cov-ring-fill" cx="55" cy="55" r="50"/>
+                    </svg>
+                    <div class="cov-ring-text">COV_AFTER_PLACEHOLDER%</div>
+                  </div>
+                  <div class="cov-info">
+                    <div class="label">Final Coverage</div>
+                    <div class="rating">COV_LABEL_PLACEHOLDER</div>
+                    <div class="progress-bar">
+                      <div class="progress-fill" style="width: COV_AFTER_PLACEHOLDER%"></div>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; margin-top:0.25rem;">
+                      <span style="font-size:0.75rem; color:var(--muted);">0%</span>
+                      <span style="font-size:0.75rem; color:var(--muted);">100%</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="card">
+                  <div class="card-label">Before</div>
+                  <div class="card-value">COV_BEFORE_PLACEHOLDER%</div>
+                  <div class="card-sub">Manual tests coverage</div>
+                </div>
+
+                <div class="card">
+                  <div class="card-label">Improvement</div>
+                  <div class="card-value DELTA_CLASS_PLACEHOLDER">COV_DELTA_PLACEHOLDER pp</div>
+                  <div class="card-sub">Coverage delta</div>
+                </div>
+              </div>
+
+              <!-- Test Results -->
+              <h3 class="section-title">Test Results</h3>
+              <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
+                <div class="card" style="text-align:center;">
+                  <div class="card-label">Generated</div>
+                  <div class="card-value" style="color: var(--primary);">TESTS_GEN_PLACEHOLDER</div>
+                  <div class="card-sub">test files</div>
+                </div>
+                <div class="card" style="text-align:center;">
+                  <div class="card-label">Total</div>
+                  <div class="card-value">TESTS_TOTAL_PLACEHOLDER</div>
+                  <div class="card-sub">test cases</div>
+                </div>
+                <div class="card" style="text-align:center;">
+                  <div class="card-label">Passed</div>
+                  <div class="card-value" style="color: var(--success);">TESTS_PASS_PLACEHOLDER</div>
+                  <div class="card-sub">PASS_RATE_PLACEHOLDER% pass rate</div>
+                </div>
+                <div class="card" style="text-align:center;">
+                  <div class="card-label">Failed</div>
+                  <div class="card-value" style="color: FAIL_COLOR_PLACEHOLDER;">TESTS_FAIL_PLACEHOLDER</div>
+                  <div class="card-sub">test cases</div>
+                </div>
+              </div>
+
+              <!-- Quality Gates -->
+              <h3 class="section-title">Quality Gates</h3>
+              <div class="card">
+                <table class="quality-table">
+                  <thead>
+                    <tr><th>Gate</th><th>Required</th><th>Actual</th><th>Status</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>Coverage Threshold</td>
+                      <td>&ge; MIN_COV_PLACEHOLDER%</td>
+                      <td>COV_AFTER_PLACEHOLDER%</td>
+                      <td><span class="badge THRESHOLD_BADGE_PLACEHOLDER">THRESHOLD_TEXT_PLACEHOLDER</span></td>
+                    </tr>
+                    <tr>
+                      <td>Delta Threshold</td>
+                      <td>&ge; DELTA_REQ_PLACEHOLDER pp</td>
+                      <td>COV_DELTA_PLACEHOLDER pp</td>
+                      <td><span class="badge DELTA_BADGE_PLACEHOLDER">DELTA_TEXT_PLACEHOLDER</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <!-- Action buttons -->
+              <div class="btn-group">
+                <a class="btn btn-primary" href="detail/index.html">View Detailed File Coverage</a>
+                <a class="btn btn-outline" href="RUN_URL_PLACEHOLDER">View Pipeline Run</a>
+              </div>
+
+              <div class="meta-bar">
+                <span>Generated by AI Test Generation Pipeline</span>
+                <span>TIMESTAMP_PLACEHOLDER</span>
+              </div>
+            </div>
+          </body>
+          </html>
+          DASHBOARD_EOF
+
+          # Replace all placeholders in the dashboard
           cd gh-pages-deploy
+          sed -i "s|REPO_PLACEHOLDER|${REPO_NAME}|g" "$REPORT_DIR/index.html"
+          sed -i "s|BRANCH_PLACEHOLDER|${BRANCH}|g" "$REPORT_DIR/index.html"
+          sed -i "s|RUN_NUM_PLACEHOLDER|${RUN_NUM}|g" "$REPORT_DIR/index.html"
+          sed -i "s|COV_BEFORE_PLACEHOLDER|${COV_BEFORE}|g" "$REPORT_DIR/index.html"
+          sed -i "s|COV_AFTER_PLACEHOLDER|${COV_AFTER}|g" "$REPORT_DIR/index.html"
+          sed -i "s|COV_DELTA_PLACEHOLDER|${COV_DELTA}|g" "$REPORT_DIR/index.html"
+          sed -i "s|COV_HUE_PLACEHOLDER|${COV_HUE}|g" "$REPORT_DIR/index.html"
+          sed -i "s|COV_LABEL_PLACEHOLDER|${COV_LABEL}|g" "$REPORT_DIR/index.html"
+          sed -i "s|TESTS_GEN_PLACEHOLDER|${TESTS_GEN}|g" "$REPORT_DIR/index.html"
+          sed -i "s|TESTS_TOTAL_PLACEHOLDER|${TESTS_TOTAL}|g" "$REPORT_DIR/index.html"
+          sed -i "s|TESTS_PASS_PLACEHOLDER|${TESTS_PASS}|g" "$REPORT_DIR/index.html"
+          sed -i "s|TESTS_FAIL_PLACEHOLDER|${TESTS_FAIL}|g" "$REPORT_DIR/index.html"
+          sed -i "s|PASS_RATE_PLACEHOLDER|${PASS_RATE}|g" "$REPORT_DIR/index.html"
+          sed -i "s|MIN_COV_PLACEHOLDER|${{ inputs.min_coverage || '90' }}|g" "$REPORT_DIR/index.html"
+          sed -i "s|DELTA_REQ_PLACEHOLDER|${{ inputs.delta_threshold || '0' }}|g" "$REPORT_DIR/index.html"
+          sed -i "s|STATUS_CLASS_PLACEHOLDER|status-banner ${STATUS_CLASS}|g" "$REPORT_DIR/index.html"
+          sed -i "s|STATUS_TEXT_PLACEHOLDER|${STATUS_TEXT}|g" "$REPORT_DIR/index.html"
+          sed -i "s|TIMESTAMP_PLACEHOLDER|${TIMESTAMP}|g" "$REPORT_DIR/index.html"
+          sed -i "s|RUN_URL_PLACEHOLDER|${RUN_URL}|g" "$REPORT_DIR/index.html"
+
+          # Calculate SVG ring offset: 314 - (314 * coverage / 100)
+          RING_OFFSET=$(python3 -c "print(f'{314 - (314 * float(\"$COV_AFTER\") / 100):.0f}')" 2>/dev/null || echo "314")
+          sed -i "s|RING_OFFSET_PLACEHOLDER|${RING_OFFSET}|g" "$REPORT_DIR/index.html"
+
+          # Delta class
+          DELTA_NUM=$(python3 -c "d=float('${COV_DELTA}'.replace('+','')); print('positive' if d>0 else ('negative' if d<0 else 'neutral'))" 2>/dev/null || echo "neutral")
+          sed -i "s|DELTA_CLASS_PLACEHOLDER|delta-${DELTA_NUM}|g" "$REPORT_DIR/index.html"
+
+          # Fail color
+          if [ "$TESTS_FAIL" = "0" ]; then
+            sed -i "s|FAIL_COLOR_PLACEHOLDER|var(--muted)|g" "$REPORT_DIR/index.html"
+          else
+            sed -i "s|FAIL_COLOR_PLACEHOLDER|var(--danger)|g" "$REPORT_DIR/index.html"
+          fi
+
+          # Threshold badges
+          if [ "$THRESHOLD_OK" = "true" ]; then
+            sed -i "s|THRESHOLD_BADGE_PLACEHOLDER|badge-pass|g" "$REPORT_DIR/index.html"
+            sed -i "s|THRESHOLD_TEXT_PLACEHOLDER|PASSED|g" "$REPORT_DIR/index.html"
+          else
+            sed -i "s|THRESHOLD_BADGE_PLACEHOLDER|badge-fail|g" "$REPORT_DIR/index.html"
+            sed -i "s|THRESHOLD_TEXT_PLACEHOLDER|FAILED|g" "$REPORT_DIR/index.html"
+          fi
+
+          DELTA_OK_VAL="${{ steps.metrics.outputs.delta_passed }}"
+          if [ "$DELTA_OK_VAL" = "true" ]; then
+            sed -i "s|DELTA_BADGE_PLACEHOLDER|badge-pass|g" "$REPORT_DIR/index.html"
+            sed -i "s|DELTA_TEXT_PLACEHOLDER|PASSED|g" "$REPORT_DIR/index.html"
+          else
+            sed -i "s|DELTA_BADGE_PLACEHOLDER|badge-fail|g" "$REPORT_DIR/index.html"
+            sed -i "s|DELTA_TEXT_PLACEHOLDER|FAILED|g" "$REPORT_DIR/index.html"
+          fi
+
+          # Also create a root index that redirects to latest run
+          cat > "gh-pages-deploy/index.html" << ROOT_EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta http-equiv="refresh" content="0; url=coverage/run-${RUN_NUM}/index.html">
+            <title>Redirecting to latest coverage report...</title>
+          </head>
+          <body>
+            <p>Redirecting to <a href="coverage/run-${RUN_NUM}/index.html">latest coverage report</a>...</p>
+          </body>
+          </html>
+          ROOT_EOF
+
+          touch .nojekyll
           git add -A
 
           if git diff --staged --quiet; then
             echo "No changes to deploy"
           else
-            git commit -m "Deploy coverage report for run #${{ github.run_number }}"
+            git commit -m "Deploy coverage report for run #${RUN_NUM}"
             git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" 2>/dev/null || git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
             git push origin gh-pages --force
             echo "Coverage report deployed!"
           fi
 
           REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ github.event.repository.name }}"
-          PAGES_URL="https://${REPO_OWNER}.github.io/${REPO_NAME}/coverage/run-${{ github.run_number }}/index.html"
+          REPO_NAME_GH="${{ github.event.repository.name }}"
+          PAGES_URL="https://${REPO_OWNER}.github.io/${REPO_NAME_GH}/coverage/run-${RUN_NUM}/index.html"
 
           echo "pages_url=$PAGES_URL" >> $GITHUB_OUTPUT
           echo "Coverage report: $PAGES_URL"
@@ -584,81 +1001,204 @@ jobs:
       - name: Generate Job Summary
         if: always()
         run: |
-          echo "# AI Test Generation Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          # Collect all values
+          REPO_NAME="${{ steps.detect-repo.outputs.repo_name }}"
+          BRANCH="${{ steps.detect-repo.outputs.repo_branch }}"
+          COV_BEFORE="${{ steps.metrics.outputs.coverage_before }}"
+          COV_AFTER="${{ steps.metrics.outputs.coverage_after }}"
+          COV_DELTA="${{ steps.metrics.outputs.coverage_delta }}"
+          TESTS_GEN="${{ steps.metrics.outputs.tests_generated }}"
+          TESTS_PASS="${{ steps.metrics.outputs.tests_passed }}"
+          TESTS_FAIL="${{ steps.metrics.outputs.tests_failed }}"
+          TESTS_TOTAL="${{ steps.metrics.outputs.tests_total }}"
+          THRESHOLD_OK="${{ steps.metrics.outputs.threshold_passed }}"
+          DELTA_OK="${{ steps.metrics.outputs.delta_passed }}"
+          MANUAL_FOUND="${{ steps.metrics.outputs.manual_tests_found }}"
+          MIN_COV="${{ inputs.min_coverage || '90' }}"
+          DELTA_REQ="${{ inputs.delta_threshold || '0' }}"
+          PAGES_URL="${{ steps.deploy-pages.outputs.pages_url }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Determine overall status
+          if [ "$THRESHOLD_OK" = "true" ] && [ "$DELTA_OK" = "true" ]; then
+            STATUS_ICON="<picture><img alt='passed' src='https://img.shields.io/badge/Pipeline-PASSED-brightgreen?style=for-the-badge&logo=githubactions&logoColor=white' /></picture>"
+            STATUS_TEXT="All quality gates passed"
+          else
+            STATUS_ICON="<picture><img alt='failed' src='https://img.shields.io/badge/Pipeline-THRESHOLD%20NOT%20MET-red?style=for-the-badge&logo=githubactions&logoColor=white' /></picture>"
+            STATUS_TEXT="Coverage threshold not met"
+          fi
+
+          # Coverage progress bar (using Unicode block characters)
+          COV_INT=$(python3 -c "print(int(float('$COV_AFTER')))" 2>/dev/null || echo "0")
+          FILLED=$((COV_INT / 5))
+          EMPTY=$((20 - FILLED))
+          BAR=""
+          for i in $(seq 1 $FILLED); do BAR="${BAR}█"; done
+          for i in $(seq 1 $EMPTY); do BAR="${BAR}░"; done
+
+          # Coverage color badge
+          if [ "$COV_INT" -ge 90 ]; then
+            COV_COLOR="brightgreen"
+          elif [ "$COV_INT" -ge 70 ]; then
+            COV_COLOR="yellow"
+          elif [ "$COV_INT" -ge 50 ]; then
+            COV_COLOR="orange"
+          else
+            COV_COLOR="red"
+          fi
+
+          # Pass rate
+          PASS_RATE="0"
+          if [ "$TESTS_TOTAL" != "0" ]; then
+            PASS_RATE=$(python3 -c "print(f'{(int(\"$TESTS_PASS\") / int(\"$TESTS_TOTAL\")) * 100:.0f}')" 2>/dev/null || echo "0")
+          fi
+
+          # Write summary
+          cat >> $GITHUB_STEP_SUMMARY << 'HEADER_EOF'
+          <div align="center">
+
+          # AI Test Generation Pipeline
+
+          **Automated test generation powered by AI for maximum code coverage**
+
+          HEADER_EOF
+
+          echo "${STATUS_ICON}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Repository Info" >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Repository** | \`${{ steps.detect-repo.outputs.repo_name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Branch** | \`${{ steps.detect-repo.outputs.repo_branch }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Run Number** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Triggered By** | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "</div>" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Coverage Metrics" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Value | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          MANUAL_STATUS="None"
-          [ "${{ steps.metrics.outputs.manual_tests_found }}" = "true" ] && MANUAL_STATUS="Found"
-          echo "| **Coverage Before** (Manual Tests) | ${{ steps.metrics.outputs.coverage_before }}% | $MANUAL_STATUS |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Coverage After** (AI + Manual) | ${{ steps.metrics.outputs.coverage_after }}% | - |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Coverage Delta** | ${{ steps.metrics.outputs.coverage_delta }} pp | - |" >> $GITHUB_STEP_SUMMARY
-          THRESHOLD_STATUS="FAILED"
-          [ "${{ steps.metrics.outputs.threshold_passed }}" = "true" ] && THRESHOLD_STATUS="PASSED"
-          echo "| **Target Threshold** | ${{ inputs.min_coverage || '90' }}% | $THRESHOLD_STATUS |" >> $GITHUB_STEP_SUMMARY
-          DELTA_STATUS="FAILED"
-          [ "${{ steps.metrics.outputs.delta_passed }}" = "true" ] && DELTA_STATUS="PASSED"
-          echo "| **Delta Threshold** | ${{ inputs.delta_threshold || '0' }} pp | $DELTA_STATUS |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **AI Generated Test Files** | ${{ steps.metrics.outputs.tests_generated }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Total Tests Run** | ${{ steps.metrics.outputs.tests_total }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Tests Passed** | ${{ steps.metrics.outputs.tests_passed }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Tests Failed** | ${{ steps.metrics.outputs.tests_failed }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
-          echo "[View Interactive Coverage Report](${{ steps.deploy-pages.outputs.pages_url }})" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Add Generated Tests Branch section if auto-push was enabled
-          if [ "${{ inputs.auto_push_tests }}" = "true" ]; then
-            echo "## Generated Tests Branch" >> $GITHUB_STEP_SUMMARY
-            if [ "${{ steps.push-tests.outputs.tests_pushed }}" = "true" ]; then
-              echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-              echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-              echo "| **Branch** | \`${{ inputs.tests_branch || 'ai-generated-tests' }}\` |" >> $GITHUB_STEP_SUMMARY
-              echo "| **Status** | Pushed |" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "[View Branch](${{ steps.push-tests.outputs.tests_branch_url }}) | [Compare with ${{ steps.detect-repo.outputs.repo_branch }}](${{ steps.push-tests.outputs.compare_url }})" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "No new tests were pushed (no changes or no tests generated)" >> $GITHUB_STEP_SUMMARY
-            fi
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "---" >> $GITHUB_STEP_SUMMARY
+          # Repository details
+          echo "### Repository" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **${REPO_NAME}** on branch \`${BRANCH}\` | Run [#${{ github.run_number }}](${RUN_URL}) | Triggered by **${{ github.actor }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Coverage section
+          echo "### Coverage Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<table>" >> $GITHUB_STEP_SUMMARY
+          echo "<tr>" >> $GITHUB_STEP_SUMMARY
+          echo "<td width='50%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Final Coverage**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${BAR} ${COV_AFTER}%" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | Before | After | Change |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Line Coverage** | ${COV_BEFORE}% | **${COV_AFTER}%** | ${COV_DELTA} pp |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "<td width='50%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Quality Gates**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Threshold icons
+          if [ "$THRESHOLD_OK" = "true" ]; then
+            echo "| Check | Required | Actual | Result |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------|----------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Coverage | >= ${MIN_COV}% | ${COV_AFTER}% | **PASSED** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Check | Required | Actual | Result |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------|----------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Coverage | >= ${MIN_COV}% | ${COV_AFTER}% | **FAILED** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "$DELTA_OK" = "true" ]; then
+            echo "| Delta | >= ${DELTA_REQ} pp | ${COV_DELTA} pp | **PASSED** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Delta | >= ${DELTA_REQ} pp | ${COV_DELTA} pp | **FAILED** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "</tr>" >> $GITHUB_STEP_SUMMARY
+          echo "</table>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Test results
+          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<table>" >> $GITHUB_STEP_SUMMARY
+          echo "<tr>" >> $GITHUB_STEP_SUMMARY
+          echo "<td align='center' width='25%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${TESTS_GEN}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Files Generated" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "<td align='center' width='25%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${TESTS_TOTAL}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Total Tests" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "<td align='center' width='25%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${TESTS_PASS}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Passed" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "<td align='center' width='25%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${TESTS_FAIL}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Failed" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "</tr>" >> $GITHUB_STEP_SUMMARY
+          echo "</table>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$TESTS_TOTAL" != "0" ]; then
+            echo "> **Pass Rate: ${PASS_RATE}%** of test cases passed" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
-          echo "## Artifacts" >> $GITHUB_STEP_SUMMARY
-          echo "| Artifact | Description |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------------|" >> $GITHUB_STEP_SUMMARY
-          echo "| \`test-results-${{ github.run_number }}\` | Coverage XML, pytest results |" >> $GITHUB_STEP_SUMMARY
-          echo "| \`coverage-report-${{ github.run_number }}\` | HTML coverage report |" >> $GITHUB_STEP_SUMMARY
-          echo "| \`generated-tests-${{ github.run_number }}\` | AI-generated test files |" >> $GITHUB_STEP_SUMMARY
+          # Manual tests info
+          if [ "$MANUAL_FOUND" = "true" ]; then
+            echo "> Manual tests were detected and included in coverage measurement" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "> No existing tests found — all tests were AI-generated" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Generated Tests Branch section
+          if [ "${{ inputs.auto_push_tests }}" = "true" ]; then
+            echo "### Generated Tests" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.push-tests.outputs.tests_pushed }}" = "true" ]; then
+              echo "> AI-generated tests have been pushed to branch \`${{ inputs.tests_branch || 'ai-generated-tests' }}\`" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "[View Branch](${{ steps.push-tests.outputs.tests_branch_url }}) | [Compare Changes](${{ steps.push-tests.outputs.compare_url }})" >> $GITHUB_STEP_SUMMARY
+            elif [ "$THRESHOLD_OK" != "true" ]; then
+              echo "> Tests were **not pushed** because coverage threshold was not met (${COV_AFTER}% < ${MIN_COV}%)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "> No new tests to push" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Links section
+          echo "### Reports" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Report | Link |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$PAGES_URL" ]; then
+            echo "| Coverage Report | [View Interactive Report](${PAGES_URL}) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "| Test Artifacts | [Download](${RUN_URL}#artifacts) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Generated Tests | \`generated-tests-${{ github.run_number }}\` artifact |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Footer
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          FINAL_STATUS="THRESHOLD NOT MET"
-          [ "${{ steps.metrics.outputs.threshold_passed }}" = "true" ] && FINAL_STATUS="SUCCESS"
-          echo "**Pipeline Status:** $FINAL_STATUS" >> $GITHUB_STEP_SUMMARY
+          echo "<sub>Generated by **AI Test Generation Pipeline** | ${STATUS_TEXT}</sub>" >> $GITHUB_STEP_SUMMARY
 
       - name: Comment on Pull Request
         if: github.event_name == 'pull_request'
@@ -666,32 +1206,48 @@ jobs:
         with:
           header: ai-testgen-v2
           message: |
-            ## AI Test Generation Results
+            <h2>AI Test Generation Pipeline</h2>
 
-            ### Coverage Summary
-            | Metric | Before | After | Delta |
-            |--------|--------|-------|-------|
-            | **Line Coverage** | ${{ steps.metrics.outputs.coverage_before }}% | ${{ steps.metrics.outputs.coverage_after }}% | ${{ steps.metrics.outputs.coverage_delta }} pp |
+            <table>
+            <tr>
+            <td width="50%">
 
-            ### Thresholds
-            | Check | Required | Actual | Status |
-            |-------|----------|--------|--------|
-            | Coverage | >= ${{ inputs.min_coverage || '90' }}% | ${{ steps.metrics.outputs.coverage_after }}% | ${{ steps.metrics.outputs.threshold_passed == 'true' && 'PASSED' || 'FAILED' }} |
-            | Delta | >= ${{ inputs.delta_threshold || '0' }} pp | ${{ steps.metrics.outputs.coverage_delta }} pp | ${{ steps.metrics.outputs.delta_passed == 'true' && 'PASSED' || 'FAILED' }} |
+            **Coverage**
 
-            ### Tests
-            - **Generated**: ${{ steps.metrics.outputs.tests_generated }} files
-            - **Passed**: ${{ steps.metrics.outputs.tests_passed }}
-            - **Failed**: ${{ steps.metrics.outputs.tests_failed }}
+            | | Before | After | Delta |
+            |---|:---:|:---:|:---:|
+            | Line Coverage | ${{ steps.metrics.outputs.coverage_before }}% | **${{ steps.metrics.outputs.coverage_after }}%** | ${{ steps.metrics.outputs.coverage_delta }} pp |
 
-            ### Links
-            - [Coverage Report](${{ steps.deploy-pages.outputs.pages_url }})
-            - [Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            ${{ inputs.auto_push_tests == 'true' && steps.push-tests.outputs.tests_pushed == 'true' && format('- [Generated Tests Branch]({0})', steps.push-tests.outputs.tests_branch_url) || '' }}
-            ${{ inputs.auto_push_tests == 'true' && steps.push-tests.outputs.tests_pushed == 'true' && format('- [Compare Changes]({0})', steps.push-tests.outputs.compare_url) || '' }}
+            </td>
+            <td width="50%">
+
+            **Quality Gates**
+
+            | Gate | Required | Actual | Status |
+            |---|:---:|:---:|:---:|
+            | Coverage | ${{ inputs.min_coverage || '90' }}% | ${{ steps.metrics.outputs.coverage_after }}% | ${{ steps.metrics.outputs.threshold_passed == 'true' && '**PASSED**' || '**FAILED**' }} |
+            | Delta | ${{ inputs.delta_threshold || '0' }} pp | ${{ steps.metrics.outputs.coverage_delta }} pp | ${{ steps.metrics.outputs.delta_passed == 'true' && '**PASSED**' || '**FAILED**' }} |
+
+            </td>
+            </tr>
+            </table>
+
+            <details>
+            <summary><strong>Test Details</strong> &mdash; ${{ steps.metrics.outputs.tests_generated }} files generated, ${{ steps.metrics.outputs.tests_passed }}/${{ steps.metrics.outputs.tests_total }} passed</summary>
+
+            | Metric | Count |
+            |--------|:-----:|
+            | AI-Generated Test Files | ${{ steps.metrics.outputs.tests_generated }} |
+            | Total Test Cases | ${{ steps.metrics.outputs.tests_total }} |
+            | Passed | ${{ steps.metrics.outputs.tests_passed }} |
+            | Failed | ${{ steps.metrics.outputs.tests_failed }} |
+
+            </details>
+
+            ${{ steps.deploy-pages.outputs.pages_url && format('[Coverage Report]({0})', steps.deploy-pages.outputs.pages_url) || '' }} | [Pipeline Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) ${{ inputs.auto_push_tests == 'true' && steps.push-tests.outputs.tests_pushed == 'true' && format('| [Generated Tests]({0})', steps.push-tests.outputs.tests_branch_url) || '' }}
 
             ---
-            *Run #${{ github.run_number }}*
+            <sub>Run #${{ github.run_number }} | ${{ steps.metrics.outputs.threshold_passed == 'true' && steps.metrics.outputs.delta_passed == 'true' && 'All quality gates passed' || 'Quality gates not met' }} | AI Test Generation Pipeline</sub>
 
       - name: Check Thresholds
         if: always()
