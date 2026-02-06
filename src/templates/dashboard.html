@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Coverage Report — {{REPO_NAME}}</title>
+  <style>
+    :root {
+      --primary: #1a73e8;
+      --success: #1e8e3e;
+      --danger: #d93025;
+      --warn: #f9ab00;
+      --bg: #f8f9fa;
+      --card: #ffffff;
+      --text: #202124;
+      --muted: #5f6368;
+      --border: #dadce0;
+      --cov-hue: {{COV_HUE}};
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    .header {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      color: white;
+      padding: 2rem 0;
+      text-align: center;
+    }
+    .header h1 { font-size: 1.8rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .header p { opacity: 0.8; font-size: 0.95rem; }
+    .status-banner { padding: 0.75rem; text-align: center; font-weight: 600; font-size: 0.95rem; letter-spacing: 0.5px; }
+    .status-passed { background: var(--success); color: white; }
+    .status-failed { background: var(--danger); color: white; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 2rem 1.5rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1.25rem; margin-bottom: 2rem; }
+    .card { background: var(--card); border-radius: 12px; padding: 1.5rem; border: 1px solid var(--border); box-shadow: 0 1px 3px rgba(0,0,0,0.08); transition: box-shadow 0.2s; }
+    .card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.12); }
+    .card-label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 0.5rem; }
+    .card-value { font-size: 2.2rem; font-weight: 700; line-height: 1.2; }
+    .card-sub { font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem; }
+    .cov-ring-card { display: flex; align-items: center; gap: 1.5rem; }
+    .cov-ring { position: relative; width: 110px; height: 110px; flex-shrink: 0; }
+    .cov-ring svg { transform: rotate(-90deg); }
+    .cov-ring-bg { fill: none; stroke: #e8eaed; stroke-width: 8; }
+    .cov-ring-fill { fill: none; stroke: hsl(var(--cov-hue), 70%, 45%); stroke-width: 8; stroke-linecap: round; stroke-dasharray: 314; stroke-dashoffset: {{RING_OFFSET}}; transition: stroke-dashoffset 1s ease; }
+    .cov-ring-text { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 1.5rem; font-weight: 700; color: hsl(var(--cov-hue), 70%, 40%); }
+    .cov-info { flex: 1; }
+    .cov-info .label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+    .cov-info .rating { font-size: 1rem; font-weight: 600; color: hsl(var(--cov-hue), 70%, 40%); margin-top: 0.25rem; }
+    .delta-positive { color: var(--success); }
+    .delta-negative { color: var(--danger); }
+    .delta-neutral { color: var(--muted); }
+    .progress-bar { width: 100%; height: 8px; background: #e8eaed; border-radius: 4px; margin-top: 0.75rem; overflow: hidden; }
+    .progress-fill { height: 100%; border-radius: 4px; background: hsl(var(--cov-hue), 70%, 45%); transition: width 1s ease; }
+    .section-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 2px solid var(--border); }
+    .btn { display: inline-block; padding: 0.75rem 1.5rem; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 0.95rem; transition: all 0.2s; }
+    .btn-primary { background: var(--primary); color: white; }
+    .btn-primary:hover { background: #1557b0; transform: translateY(-1px); }
+    .btn-outline { background: transparent; color: var(--primary); border: 2px solid var(--primary); }
+    .btn-outline:hover { background: var(--primary); color: white; }
+    .btn-group { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 1.5rem; }
+    .meta-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; padding: 1rem 0; margin-top: 2rem; border-top: 1px solid var(--border); font-size: 0.8rem; color: var(--muted); }
+    .quality-table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; }
+    .quality-table th, .quality-table td { padding: 0.6rem 1rem; text-align: left; border-bottom: 1px solid var(--border); }
+    .quality-table th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
+    .badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+    .badge-pass { background: #e6f4ea; color: var(--success); }
+    .badge-fail { background: #fce8e6; color: var(--danger); }
+    .tab-nav { display: flex; gap: 0; border-bottom: 2px solid var(--border); margin-bottom: 2rem; overflow-x: auto; }
+    .tab-btn { padding: 0.75rem 1.5rem; border: none; background: none; cursor: pointer; font-size: 0.95rem; font-weight: 500; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; white-space: nowrap; }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .file-table { width: 100%; border-collapse: collapse; }
+    .file-table th, .file-table td { padding: 0.6rem 1rem; text-align: left; border-bottom: 1px solid var(--border); }
+    .file-table th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--card); }
+    .file-table th:hover { color: var(--text); }
+    .file-table tr:hover td { background: #f1f3f4; }
+    .file-link { color: var(--primary); text-decoration: none; word-break: break-all; font-size: 0.88rem; }
+    .file-link:hover { text-decoration: underline; }
+    .mini-bar { width: 100%; height: 6px; background: #e8eaed; border-radius: 3px; overflow: hidden; }
+    .mini-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
+    .file-summary { display: flex; gap: 2rem; padding: 1rem 0; flex-wrap: wrap; }
+    .file-summary-item { font-size: 0.85rem; color: var(--muted); }
+    .file-summary-item strong { color: var(--text); font-size: 1rem; }
+    .file-table-wrap { max-height: 600px; overflow-y: auto; border-radius: 8px; }
+    .search-bar { margin-bottom: 1rem; }
+    .search-bar input { width: 100%; padding: 0.65rem 1rem; border: 1px solid var(--border); border-radius: 8px; font-size: 0.9rem; outline: none; transition: border-color 0.2s; background: var(--card); }
+    .search-bar input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(26,115,232,0.1); }
+    .test-group { margin-bottom: 0.75rem; }
+    .test-group-header { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1rem; background: var(--card); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; user-select: none; font-weight: 600; font-size: 0.9rem; transition: background 0.15s; }
+    .test-group-header:hover { background: #f1f3f4; }
+    .test-group-header.expanded { border-radius: 8px 8px 0 0; }
+    .test-group-body { border: 1px solid var(--border); border-top: none; border-radius: 0 0 8px 8px; overflow: hidden; }
+    .test-item { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 1rem; border-bottom: 1px solid #f1f3f4; font-size: 0.85rem; }
+    .test-item:last-child { border-bottom: none; }
+    .test-name { flex: 1; word-break: break-all; font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace; font-size: 0.82rem; }
+    .test-duration { color: var(--muted); font-size: 0.78rem; min-width: 55px; text-align: right; }
+    .badge-passed { background: #e6f4ea; color: var(--success); }
+    .badge-failed { background: #fce8e6; color: var(--danger); }
+    .badge-skipped { background: #fef7e0; color: var(--warn); }
+    .badge-error { background: #fce8e6; color: var(--danger); }
+    .sort-icon { font-size: 0.65rem; opacity: 0.4; margin-left: 0.25rem; }
+    .chevron { transition: transform 0.2s; display: inline-block; font-size: 0.7rem; }
+    .chevron.open { transform: rotate(90deg); }
+    .test-summary-bar { display: flex; gap: 1.5rem; margin-bottom: 1.25rem; flex-wrap: wrap; padding: 1rem 1.25rem; background: var(--card); border: 1px solid var(--border); border-radius: 8px; }
+    .test-summary-item { font-size: 0.85rem; color: var(--muted); }
+    .test-summary-item strong { color: var(--text); font-size: 1.05rem; }
+    .empty-state { text-align: center; padding: 3rem 2rem; color: var(--muted); font-size: 0.95rem; }
+    @media (max-width: 600px) {
+      .container { padding: 1rem; }
+      .grid { grid-template-columns: 1fr 1fr; }
+      .cov-ring-card { flex-direction: column; text-align: center; }
+      .tab-btn { padding: 0.6rem 1rem; font-size: 0.85rem; }
+      .file-table th, .file-table td { padding: 0.4rem 0.5rem; font-size: 0.8rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Coverage Report</h1>
+    <p>{{REPO_NAME}} &mdash; {{BRANCH}} &mdash; Run #{{RUN_NUM}}</p>
+  </div>
+  <div class="status-banner {{STATUS_CLASS}}">{{STATUS_TEXT}}</div>
+  <div class="container">
+    <div class="tab-nav">
+      <button class="tab-btn active" onclick="switchTab('overview',this)">Overview</button>
+      <button class="tab-btn" onclick="switchTab('files',this)">File Coverage</button>
+      <button class="tab-btn" onclick="switchTab('tests',this)">Test Details</button>
+    </div>
+    <div id="tab-overview" class="tab-content active">
+      <div class="grid">
+        <div class="card cov-ring-card" style="grid-column: span 2;">
+          <div class="cov-ring">
+            <svg width="110" height="110" viewBox="0 0 110 110">
+              <circle class="cov-ring-bg" cx="55" cy="55" r="50"/>
+              <circle class="cov-ring-fill" cx="55" cy="55" r="50"/>
+            </svg>
+            <div class="cov-ring-text">{{COV_AFTER}}%</div>
+          </div>
+          <div class="cov-info">
+            <div class="label">Final Coverage</div>
+            <div class="rating">{{COV_LABEL}}</div>
+            <div class="progress-bar"><div class="progress-fill" style="width: {{COV_AFTER}}%"></div></div>
+            <div style="display:flex; justify-content:space-between; margin-top:0.25rem;">
+              <span style="font-size:0.75rem; color:var(--muted);">0%</span>
+              <span style="font-size:0.75rem; color:var(--muted);">100%</span>
+            </div>
+          </div>
+        </div>
+        <div class="card"><div class="card-label">Before</div><div class="card-value">{{COV_BEFORE}}%</div><div class="card-sub">Manual tests coverage</div></div>
+        <div class="card"><div class="card-label">Improvement</div><div class="card-value {{DELTA_CLASS}}">{{COV_DELTA}} pp</div><div class="card-sub">Coverage delta</div></div>
+      </div>
+      <h3 class="section-title">Test Results</h3>
+      <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
+        <div class="card" style="text-align:center;"><div class="card-label">Generated</div><div class="card-value" style="color: var(--primary);">{{TESTS_GEN}}</div><div class="card-sub">test files</div></div>
+        <div class="card" style="text-align:center;"><div class="card-label">Total</div><div class="card-value">{{TESTS_TOTAL}}</div><div class="card-sub">test cases</div></div>
+        <div class="card" style="text-align:center;"><div class="card-label">Passed</div><div class="card-value" style="color: var(--success);">{{TESTS_PASS}}</div><div class="card-sub">{{PASS_RATE}}% pass rate</div></div>
+        <div class="card" style="text-align:center;"><div class="card-label">Failed</div><div class="card-value" style="color: {{FAIL_COLOR}};">{{TESTS_FAIL}}</div><div class="card-sub">test cases</div></div>
+      </div>
+      <h3 class="section-title">Quality Gates</h3>
+      <div class="card">
+        <table class="quality-table">
+          <thead><tr><th>Gate</th><th>Required</th><th>Actual</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>Coverage Threshold</td><td>&ge; {{MIN_COV}}%</td><td>{{COV_AFTER}}%</td><td><span class="badge {{THRESHOLD_BADGE}}">{{THRESHOLD_TEXT}}</span></td></tr>
+            <tr><td>Delta Threshold</td><td>&ge; {{DELTA_REQ}} pp</td><td>{{COV_DELTA}} pp</td><td><span class="badge {{DELTA_BADGE}}">{{DELTA_TEXT}}</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="btn-group">
+        <a class="btn btn-primary" href="detail/index.html">View Raw Coverage Report</a>
+        <a class="btn btn-outline" href="{{RUN_URL}}">View Pipeline Run</a>
+      </div>
+    </div>
+    <div id="tab-files" class="tab-content">
+      <div id="file-summary" class="file-summary"></div>
+      <div class="search-bar"><input type="text" id="file-search" placeholder="Search files by name..." oninput="filterFiles()"></div>
+      <div class="card" style="padding:0; overflow:hidden;"><div class="file-table-wrap">
+        <table class="file-table">
+          <thead><tr>
+            <th onclick="sortFiles('f')">File <span class="sort-icon">&#8597;</span></th>
+            <th onclick="sortFiles('s')" style="width:70px">Stmts <span class="sort-icon">&#8597;</span></th>
+            <th onclick="sortFiles('m')" style="width:60px">Miss <span class="sort-icon">&#8597;</span></th>
+            <th onclick="sortFiles('h')" style="width:70px">Cover <span class="sort-icon">&#8597;</span></th>
+            <th onclick="sortFiles('c')" style="width:80px">% <span class="sort-icon">&#8597;</span></th>
+            <th style="width:130px">Progress</th>
+          </tr></thead>
+          <tbody id="file-tbody"></tbody>
+        </table>
+      </div></div>
+    </div>
+    <div id="tab-tests" class="tab-content">
+      <div id="test-summary" class="test-summary-bar"></div>
+      <div class="search-bar"><input type="text" id="test-search" placeholder="Search tests by name, file, or class..." oninput="filterTests()"></div>
+      <div id="test-groups"></div>
+    </div>
+    <div class="meta-bar">
+      <span>Generated by AI Test Generation Pipeline</span>
+      <span>{{TIMESTAMP}}</span>
+    </div>
+  </div>
+  <script src="data.js"></script>
+  <script>
+  (function(){
+    var D=window.PIPELINE_DATA||{files:[],tests:[]};var sCol='c',sAsc=false;
+    function hue(c){return c>=90?142:c>=70?60:c>=50?30:0;}
+    function renderFileSummary(){var el=document.getElementById('file-summary');if(!el||!D.files.length)return;var ts=0,th=0,tm=0;D.files.forEach(function(f){ts+=f.s;th+=f.h;tm+=f.m;});var avg=ts?Math.round(th/ts*100):0;el.innerHTML='<div class="file-summary-item"><strong>'+D.files.length+'</strong> files analyzed</div><div class="file-summary-item"><strong>'+ts+'</strong> total statements</div><div class="file-summary-item"><strong>'+th+'</strong> covered</div><div class="file-summary-item"><strong>'+tm+'</strong> missed</div><div class="file-summary-item">Avg: <strong>'+avg+'%</strong></div>';}
+    function renderFiles(q){var tbody=document.getElementById('file-tbody');if(!tbody)return;if(!D.files.length){tbody.innerHTML='<tr><td colspan="6" class="empty-state">No file coverage data available</td></tr>';return;}var files=D.files.slice();if(q){var ql=q.toLowerCase();files=files.filter(function(f){return f.f.toLowerCase().indexOf(ql)>=0;});}files.sort(function(a,b){var va=a[sCol],vb=b[sCol];if(typeof va==='string')return sAsc?va.localeCompare(vb):vb.localeCompare(va);return sAsc?va-vb:vb-va;});var html='';files.forEach(function(f){var h=hue(f.c);var link='detail/'+f.f.replace(/\//g,'_').replace(/\./g,'_')+'.html';html+='<tr><td><a class="file-link" href="'+link+'" title="'+f.f+'">'+f.f+'</a></td><td>'+f.s+'</td><td style="color:'+(f.m>0?'var(--danger)':'var(--muted)')+'">'+f.m+'</td><td>'+f.h+'</td><td style="font-weight:700;color:hsl('+h+',70%,40%)">'+f.c+'%</td><td><div class="mini-bar"><div class="mini-fill" style="width:'+f.c+'%;background:hsl('+h+',70%,45%)"></div></div></td></tr>';});if(!html)html='<tr><td colspan="6" class="empty-state">No files match your search</td></tr>';tbody.innerHTML=html;}
+    window.sortFiles=function(col){if(sCol===col)sAsc=!sAsc;else{sCol=col;sAsc=col==='f';}renderFiles(document.getElementById('file-search').value);};
+    window.filterFiles=function(){renderFiles(document.getElementById('file-search').value);};
+    function renderTestSummary(){var el=document.getElementById('test-summary');if(!el||!D.tests.length){if(el)el.style.display='none';return;}var p=0,f=0,s=0,e=0;D.tests.forEach(function(t){if(t.o==='passed')p++;else if(t.o==='failed')f++;else if(t.o==='skipped')s++;else e++;});el.innerHTML='<div class="test-summary-item"><strong>'+D.tests.length+'</strong> total tests</div><div class="test-summary-item" style="color:var(--success)"><strong>'+p+'</strong> passed</div>'+(f?'<div class="test-summary-item" style="color:var(--danger)"><strong>'+f+'</strong> failed</div>':'')+(s?'<div class="test-summary-item" style="color:var(--warn)"><strong>'+s+'</strong> skipped</div>':'')+(e?'<div class="test-summary-item" style="color:var(--danger)"><strong>'+e+'</strong> errors</div>':'');}
+    function renderTests(q){var container=document.getElementById('test-groups');if(!container)return;if(!D.tests.length){container.innerHTML='<div class="empty-state">No test results available</div>';return;}var groups={};D.tests.forEach(function(t){var parts=t.n.split('::');var file=parts[0]||'unknown';if(!groups[file])groups[file]=[];groups[file].push({name:parts.slice(1).join(' :: '),outcome:t.o,duration:t.d,raw:t.n});});var keys=Object.keys(groups).sort();if(q){var ql=q.toLowerCase();keys=keys.filter(function(k){if(k.toLowerCase().indexOf(ql)>=0)return true;return groups[k].some(function(t){return t.raw.toLowerCase().indexOf(ql)>=0;});});}var html='';keys.forEach(function(file,idx){var tests=groups[file];if(q){var ql=q.toLowerCase();if(file.toLowerCase().indexOf(ql)<0){tests=tests.filter(function(t){return t.raw.toLowerCase().indexOf(ql)>=0;});}}var passed=tests.filter(function(t){return t.o==='passed';}).length;var failed=tests.filter(function(t){return t.o==='failed';}).length;var bc=failed>0?'badge-failed':'badge-passed';var st=failed>0?failed+' failed':'all passed';html+='<div class="test-group"><div class="test-group-header expanded" onclick="toggleGroup('+idx+')"><span class="chevron open" id="chev-'+idx+'">&#9654;</span><span style="flex:1;word-break:break-all">'+file+'</span><span class="badge '+bc+'">'+st+'</span><span style="color:var(--muted);font-size:0.78rem">'+tests.length+' tests</span></div><div class="test-group-body" id="grp-'+idx+'">';tests.forEach(function(t){var tbc=t.outcome==='passed'?'badge-passed':t.outcome==='failed'?'badge-failed':t.outcome==='skipped'?'badge-skipped':'badge-error';html+='<div class="test-item"><span class="badge '+tbc+'">'+t.outcome+'</span><span class="test-name">'+t.name+'</span><span class="test-duration">'+t.duration+'s</span></div>';});html+='</div></div>';});if(!html)html='<div class="empty-state">No tests match your search</div>';container.innerHTML=html;}
+    window.toggleGroup=function(idx){var body=document.getElementById('grp-'+idx);var chev=document.getElementById('chev-'+idx);var hdr=chev.parentElement;if(body.style.display==='none'){body.style.display='block';chev.classList.add('open');hdr.classList.add('expanded');}else{body.style.display='none';chev.classList.remove('open');hdr.classList.remove('expanded');}};
+    window.filterTests=function(){renderTests(document.getElementById('test-search').value);};
+    window.switchTab=function(tab,btn){document.querySelectorAll('.tab-btn').forEach(function(b){b.classList.remove('active');});document.querySelectorAll('.tab-content').forEach(function(c){c.classList.remove('active');c.style.display='none';});var el=document.getElementById('tab-'+tab);if(el){el.classList.add('active');el.style.display='block';}if(btn)btn.classList.add('active');};
+    renderFileSummary();renderFiles();renderTestSummary();renderTests();
+  })();
+  </script>
+</body>
+</html>
