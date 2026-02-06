@@ -38,10 +38,18 @@ class DjangoHandler(BaseFrameworkHandler):
         if not isinstance(analysis, dict):
             return False
 
-        # Django in imports
+        # Django in imports (handle both dict and string import entries)
         imports = analysis.get("imports", [])
-        if any(any("django" in str(m).lower() for m in imp.get("modules", [])) for imp in imports):
-            return True
+        for imp in imports:
+            if isinstance(imp, dict):
+                modules = imp.get("modules", [])
+                if isinstance(modules, str):
+                    modules = [modules]
+                if any("django" in str(m).lower() for m in modules):
+                    return True
+            elif isinstance(imp, str):
+                if "django" in imp.lower():
+                    return True
 
         # Common Django files in project structure
         ps = analysis.get("project_structure", {}) or {}

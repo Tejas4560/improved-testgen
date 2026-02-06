@@ -142,11 +142,25 @@ class FrameworkManager(FrameworkManager):  # type: ignore[misc]
         if "django" in detected and any(p.endswith(("manage.py", "settings.py")) for p in module_paths):
             return "django"
 
+        # Helper to safely extract module names from imports (handles both dict and str)
+        def _import_mentions(framework_name: str) -> bool:
+            for imp in analysis.get("imports", []):
+                if isinstance(imp, dict):
+                    modules = imp.get("modules", [])
+                    if isinstance(modules, str):
+                        modules = [modules]
+                    if any(framework_name in str(m).lower() for m in modules):
+                        return True
+                elif isinstance(imp, str):
+                    if framework_name in imp.lower():
+                        return True
+            return False
+
         # FastAPI signal: presence of FastAPI(), APIRouter(), or fastapi_routes
         if "fastapi" in detected and (
             analysis.get("fastapi_routes")
             or analysis.get("fastapi_app_inits")
-            or any("fastapi" in str(m).lower() for imp in analysis.get("imports", []) for m in imp.get("modules", []))
+            or _import_mentions("fastapi")
         ):
             return "fastapi"
 
@@ -154,7 +168,7 @@ class FrameworkManager(FrameworkManager):  # type: ignore[misc]
         if "flask" in detected and (
             analysis.get("flask_routes")
             or analysis.get("flask_app_inits")
-            or any("flask" in str(m).lower() for imp in analysis.get("imports", []) for m in imp.get("modules", []))
+            or _import_mentions("flask")
         ):
             return "flask"
 

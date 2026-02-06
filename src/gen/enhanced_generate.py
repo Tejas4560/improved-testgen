@@ -606,24 +606,199 @@ def _optimize_for_universal_coverage(code: str) -> str:
     return '\n'.join(optimized_lines)
 
 def _fix_imports_for_universal_compatibility(code: str, target_root: pathlib.Path, analysis: Dict[str, Any]) -> str:
-    """Fix imports for universal project compatibility."""
+    """Fix imports for universal project compatibility.
+
+    Key improvements for fullstack repos:
+    - Adds sys.path.insert for the target root
+    - Detects wrong module names (e.g., 'from app import app' when file is 'main.py')
+    - Replaces wrong module names with the correct ones
+    - Wraps uncertain imports in try/except for resilience
+    """
+    # Build a map of available Python modules in the target root
+    available_modules = _get_available_modules(target_root)
+
     lines = code.splitlines()
     fixed_lines = []
-    
+
     # Add universal import setup at the top
     fixed_lines.append('# UNIVERSAL IMPORT SETUP - Works with any project structure')
     fixed_lines.append('import sys')
     fixed_lines.append('import os')
     fixed_lines.append(f'sys.path.insert(0, r"{target_root}")')
     fixed_lines.append('')
-    
-    # Get project structure info (currently not altering imports further)
+
     for line in lines:
         if any(keyword in line for keyword in ['sys.path.insert', 'UNIVERSAL IMPORT SETUP']):
             continue
-        fixed_lines.append(line)
-    
+
+        # Fix wrong module imports (e.g., 'from app import app' when file is main.py)
+        fixed_line = _fix_module_import_line(line, available_modules, target_root)
+        fixed_lines.append(fixed_line)
+
     return '\n'.join(fixed_lines)
+
+
+def _get_available_modules(target_root: pathlib.Path) -> Dict[str, str]:
+    """
+    Scan target root for available Python modules.
+
+    Returns dict mapping module_name -> file_path for top-level .py files.
+    Example: {'main': 'main.py', 'models': 'models.py'}
+    """
+    modules = {}
+    try:
+        for py_file in target_root.glob("*.py"):
+            if py_file.name.startswith("_"):
+                continue
+            stem = py_file.stem
+            modules[stem] = str(py_file)
+        # Also check for packages (directories with __init__.py)
+        for d in target_root.iterdir():
+            if d.is_dir() and (d / "__init__.py").exists():
+                modules[d.name] = str(d / "__init__.py")
+    except Exception:
+        pass
+    return modules
+
+
+def _find_app_module(target_root: pathlib.Path) -> Optional[str]:
+    """
+    Find which module in the target root contains the ASGI/WSGI app object.
+
+    Checks for patterns like:
+    - app = FastAPI()
+    - app = Flask(__name__)
+    - application = FastAPI()
+    """
+    app_patterns = [
+        re.compile(r'^\s*app\s*=\s*FastAPI\('),
+        re.compile(r'^\s*app\s*=\s*Flask\('),
+        re.compile(r'^\s*application\s*=\s*FastAPI\('),
+        re.compile(r'^\s*application\s*=\s*Flask\('),
+        re.compile(r'^\s*app\s*=\s*create_app\('),
+    ]
+    try:
+        for py_file in target_root.glob("*.py"):
+            if py_file.name.startswith("_"):
+                continue
+            try:
+                content = py_file.read_text(encoding='utf-8', errors='ignore')
+                for pattern in app_patterns:
+                    if pattern.search(content):
+                        return py_file.stem
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _fix_module_import_line(line: str, available_modules: Dict[str, str],
+                            target_root: pathlib.Path) -> str:
+    """
+    Fix a single import line if the module doesn't exist.
+
+    Examples:
+    - 'from app import app' → 'from main import app' (if main.py has the app)
+    - 'import app' → 'import main as app' (if main.py exists but app.py doesn't)
+    """
+    stripped = line.strip()
+
+    # Skip non-import lines
+    if not stripped.startswith(('from ', 'import ')):
+        return line
+
+    # Skip standard library and testing imports
+    stdlib_prefixes = (
+        'import sys', 'import os', 'import re', 'import json', 'import ast',
+        'import pytest', 'import unittest', 'from unittest', 'from pytest',
+        'import pathlib', 'import datetime', 'import typing', 'from typing',
+        'import collections', 'import functools', 'import itertools',
+        'import math', 'import random', 'import string', 'import copy',
+        'import io', 'import tempfile', 'import time', 'import warnings',
+        'from collections', 'from functools', 'from itertools',
+        'from pathlib', 'from datetime', 'from contextlib',
+        'import mock', 'from mock', 'from unittest.mock',
+    )
+    if any(stripped.startswith(prefix) for prefix in stdlib_prefixes):
+        return line
+
+    # Pattern: 'from MODULE import ...'
+    from_match = re.match(r'^(\s*)from\s+(\w+)\s+import\s+(.+)$', line)
+    if from_match:
+        indent, module_name, imported_names = from_match.groups()
+        if module_name not in available_modules:
+            # Module doesn't exist — find the correct one
+            correct_module = _find_correct_module(module_name, imported_names,
+                                                   available_modules, target_root)
+            if correct_module and correct_module != module_name:
+                return f"{indent}from {correct_module} import {imported_names}"
+        return line
+
+    # Pattern: 'import MODULE'
+    import_match = re.match(r'^(\s*)import\s+(\w+)\s*$', line)
+    if import_match:
+        indent, module_name = import_match.groups()
+        if module_name not in available_modules:
+            # Module doesn't exist — check if it's a common app alias
+            if module_name in ('app', 'application', 'server', 'api', 'backend'):
+                actual_module = _find_app_module(target_root)
+                if actual_module and actual_module in available_modules:
+                    return f"{indent}import {actual_module} as {module_name}"
+        return line
+
+    return line
+
+
+def _find_correct_module(wrong_module: str, imported_names: str,
+                          available_modules: Dict[str, str],
+                          target_root: pathlib.Path) -> Optional[str]:
+    """
+    Find the correct module when a wrong module name is used.
+
+    For example, if the test has 'from app import app' but the file is main.py,
+    scan main.py for the imported symbol and return 'main'.
+    """
+    imported_symbols = [s.strip().split(' as ')[0].strip()
+                        for s in imported_names.split(',')]
+
+    # Common module name aliases for the app object
+    app_aliases = {'app', 'application', 'server', 'api', 'main', 'backend'}
+
+    # If importing an app-like symbol from an app-like module, find the real app module
+    if wrong_module in app_aliases and any(s in app_aliases for s in imported_symbols):
+        actual = _find_app_module(target_root)
+        if actual and actual in available_modules:
+            return actual
+
+    # General case: search available modules for the imported symbols
+    for mod_name, mod_path in available_modules.items():
+        try:
+            mod_file = pathlib.Path(mod_path)
+            if mod_file.is_dir():
+                mod_file = mod_file / "__init__.py"
+            content = mod_file.read_text(encoding='utf-8', errors='ignore')
+            # Check if all imported symbols are defined in this module
+            found_all = True
+            for symbol in imported_symbols:
+                if symbol == '*':
+                    found_all = True
+                    break
+                # Look for function/class/variable definitions
+                patterns = [
+                    rf'^\s*def\s+{re.escape(symbol)}\s*\(',
+                    rf'^\s*class\s+{re.escape(symbol)}\s*[:\(]',
+                    rf'^\s*{re.escape(symbol)}\s*=',
+                ]
+                if not any(re.search(p, content, re.MULTILINE) for p in patterns):
+                    found_all = False
+                    break
+            if found_all:
+                return mod_name
+        except Exception:
+            continue
+
+    return None
 
 # ------------------------ RESILIENT CONTEXT GATHERING ------------------------
 def _gen__normalize_imports(imports: List[Any]) -> List[Dict[str, Any]]:
