@@ -7,103 +7,75 @@ import xml.etree.ElementTree as ET
 
 
 def extract_file_coverage(coverage_xml_path):
-    """Extract per-file coverage data from coverage.xml (Cobertura format).
-
-    Aggregates all <class> elements by filename to produce one row per file.
-    """
+    """Extract per-file coverage data from coverage.xml (Cobertura format)."""
+    files = []
     if not os.path.exists(coverage_xml_path):
-        return []
+        return files
     try:
         tree = ET.parse(coverage_xml_path)
+        for cls in tree.findall('.//class'):
+            fn = cls.attrib.get('filename', '')
+            lr = float(cls.attrib.get('line-rate', 0))
+            lines = cls.findall('.//line')
+            total = len(lines)
+            hit = sum(1 for l in lines if int(l.attrib.get('hits', 0)) > 0)
+            files.append({
+                'f': fn, 's': total, 'h': hit,
+                'm': total - hit, 'c': round(lr * 100, 1)
+            })
     except Exception as e:
         print(f"Warning: coverage.xml parse error: {e}", file=sys.stderr)
-        return []
-
-    # Aggregate by filename (use direct lines/line to avoid double-counting
-    # with method-level lines)
-    file_map = {}
-    for cls in tree.findall('.//class'):
-        fn = cls.attrib.get('filename', '')
-        lines = cls.findall('lines/line')
-        total = len(lines)
-        hit = sum(1 for ln in lines if int(ln.attrib.get('hits', 0)) > 0)
-        if fn not in file_map:
-            file_map[fn] = {'s': 0, 'h': 0}
-        file_map[fn]['s'] += total
-        file_map[fn]['h'] += hit
-
-    files = []
-    for fn, d in sorted(file_map.items()):
-        miss = d['s'] - d['h']
-        cov = round(d['h'] / d['s'] * 100, 1) if d['s'] > 0 else 0
-        files.append({'f': fn, 's': d['s'], 'h': d['h'], 'm': miss, 'c': cov})
     return files
 
 
-def extract_function_coverage(coverage_xml_path):
-    """Extract per-function/method coverage from coverage.xml.
-
-    Each <method> inside a <class> becomes one row:
-      file, class, function, stmts, hit, miss, coverage%
-    """
-    if not os.path.exists(coverage_xml_path):
-        return []
+def _load_materialization_map(pipeline_dir):
+    """Load materialization map if it exists (maps old filenames to new)."""
+    map_path = os.path.join(pipeline_dir, 'tests', 'generated',
+                            '_materialization_map.json')
+    if not os.path.exists(map_path):
+        return None
     try:
-        tree = ET.parse(coverage_xml_path)
+        with open(map_path) as f:
+            return json.load(f)
     except Exception as e:
-        print(f"Warning: coverage.xml parse error: {e}", file=sys.stderr)
-        return []
-
-    funcs = []
-    for cls in tree.findall('.//class'):
-        fn = cls.attrib.get('filename', '')
-        cls_name = cls.attrib.get('name', '')
-        for meth in cls.findall('methods/method'):
-            mname = meth.attrib.get('name', '')
-            lines = meth.findall('lines/line')
-            total = len(lines)
-            hit = sum(1 for ln in lines if int(ln.attrib.get('hits', 0)) > 0)
-            miss = total - hit
-            cov = round(hit / total * 100, 1) if total > 0 else 100
-            funcs.append({
-                'f': fn, 'cl': cls_name, 'fn': mname,
-                's': total, 'h': hit, 'm': miss, 'c': cov,
-            })
-    return funcs
+        print(f"Warning: materialization map parse error: {e}", file=sys.stderr)
+        return None
 
 
-def extract_class_coverage(coverage_xml_path):
-    """Extract per-class coverage from coverage.xml.
+def _detect_test_kind(nodeid):
+    """Detect test kind (unit/integ/e2e) from a pytest nodeid."""
+    import re
+    m = re.search(r'test_(unit|integ|e2e)_', nodeid)
+    return m.group(1) if m else 'unit'
 
-    Each <class> element becomes one row:
-      file, class, stmts, hit, miss, coverage%
+
+def _transform_nodeid(nodeid, mat_map):
+    """Transform a pytest nodeid using the materialization file map.
+
+    Input:  tests/generated/test_unit_20250207_143022_01.py::test_foo
+    Output: test_app.py::TestAppUnit::test_foo
     """
-    if not os.path.exists(coverage_xml_path):
-        return []
-    try:
-        tree = ET.parse(coverage_xml_path)
-    except Exception as e:
-        print(f"Warning: coverage.xml parse error: {e}", file=sys.stderr)
-        return []
-
-    classes = []
-    for cls in tree.findall('.//class'):
-        fn = cls.attrib.get('filename', '')
-        cls_name = cls.attrib.get('name', '')
-        lines = cls.findall('lines/line')
-        total = len(lines)
-        hit = sum(1 for ln in lines if int(ln.attrib.get('hits', 0)) > 0)
-        miss = total - hit
-        cov = round(hit / total * 100, 1) if total > 0 else 100
-        classes.append({
-            'f': fn, 'cl': cls_name,
-            's': total, 'h': hit, 'm': miss, 'c': cov,
-        })
-    return classes
+    if not mat_map:
+        return nodeid
+    file_map = mat_map.get('file_map', {})
+    # Extract the filename from the nodeid (last path component before ::)
+    parts = nodeid.split('::')
+    file_part = parts[0]
+    basename = os.path.basename(file_part)
+    if basename in file_map:
+        new_file = file_map[basename]
+        parts[0] = new_file
+        return '::'.join(parts)
+    return nodeid
 
 
 def extract_test_results(pipeline_dir):
-    """Extract per-test results from pytest JSON report."""
+    """Extract per-test results from pytest JSON report.
+
+    If a materialization map exists, transforms nodeids to reflect the
+    source-file-mapped test structure and adds a kind field (unit/integ/e2e).
+    """
+    mat_map = _load_materialization_map(pipeline_dir)
     tests = []
     for jf in ['.pytest_combined.json', '.pytest_generated.json', '.pytest_manual.json']:
         fpath = os.path.join(pipeline_dir, jf)
@@ -112,10 +84,13 @@ def extract_test_results(pipeline_dir):
                 with open(fpath) as f:
                     jdata = json.load(f)
                 for t in jdata.get('tests', []):
+                    nodeid = t.get('nodeid', '')
+                    kind = _detect_test_kind(nodeid)
                     tests.append({
-                        'n': t.get('nodeid', ''),
+                        'n': _transform_nodeid(nodeid, mat_map),
                         'o': t.get('outcome', 'unknown'),
-                        'd': round(t.get('duration', 0), 3)
+                        'd': round(t.get('duration', 0), 3),
+                        'k': kind,
                     })
             except Exception as e:
                 print(f"Warning: {jf} parse error: {e}", file=sys.stderr)
@@ -214,22 +189,16 @@ def main():
     # Extract detailed data for data.js
     cov_xml = os.path.join(pipeline_dir, 'coverage.xml')
     file_data = extract_file_coverage(cov_xml)
-    func_data = extract_function_coverage(cov_xml)
-    class_data = extract_class_coverage(cov_xml)
     test_data = extract_test_results(pipeline_dir)
 
     # Write data.js
     data_js_content = 'window.PIPELINE_DATA=' + json.dumps(
-        {'files': file_data, 'funcs': func_data,
-         'classes': class_data, 'tests': test_data},
-        separators=(',', ':')
+        {'files': file_data, 'tests': test_data}, separators=(',', ':')
     ) + ';\n'
     data_js_path = os.path.join(output_dir, 'data.js')
     with open(data_js_path, 'w') as f:
         f.write(data_js_content)
-    print(f"Generated data.js: {len(file_data)} files, "
-          f"{len(func_data)} functions, {len(class_data)} classes, "
-          f"{len(test_data)} tests")
+    print(f"Generated data.js: {len(file_data)} files, {len(test_data)} tests")
 
     # Read template
     with open(template_path) as f:
