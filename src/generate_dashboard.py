@@ -28,8 +28,54 @@ def extract_file_coverage(coverage_xml_path):
     return files
 
 
+def _load_materialization_map(pipeline_dir):
+    """Load materialization map if it exists (maps old filenames to new)."""
+    map_path = os.path.join(pipeline_dir, 'tests', 'generated',
+                            '_materialization_map.json')
+    if not os.path.exists(map_path):
+        return None
+    try:
+        with open(map_path) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: materialization map parse error: {e}", file=sys.stderr)
+        return None
+
+
+def _detect_test_kind(nodeid):
+    """Detect test kind (unit/integ/e2e) from a pytest nodeid."""
+    import re
+    m = re.search(r'test_(unit|integ|e2e)_', nodeid)
+    return m.group(1) if m else 'unit'
+
+
+def _transform_nodeid(nodeid, mat_map):
+    """Transform a pytest nodeid using the materialization file map.
+
+    Input:  tests/generated/test_unit_20250207_143022_01.py::test_foo
+    Output: test_app.py::TestAppUnit::test_foo
+    """
+    if not mat_map:
+        return nodeid
+    file_map = mat_map.get('file_map', {})
+    # Extract the filename from the nodeid (last path component before ::)
+    parts = nodeid.split('::')
+    file_part = parts[0]
+    basename = os.path.basename(file_part)
+    if basename in file_map:
+        new_file = file_map[basename]
+        parts[0] = new_file
+        return '::'.join(parts)
+    return nodeid
+
+
 def extract_test_results(pipeline_dir):
-    """Extract per-test results from pytest JSON report."""
+    """Extract per-test results from pytest JSON report.
+
+    If a materialization map exists, transforms nodeids to reflect the
+    source-file-mapped test structure and adds a kind field (unit/integ/e2e).
+    """
+    mat_map = _load_materialization_map(pipeline_dir)
     tests = []
     for jf in ['.pytest_combined.json', '.pytest_generated.json', '.pytest_manual.json']:
         fpath = os.path.join(pipeline_dir, jf)
@@ -38,10 +84,13 @@ def extract_test_results(pipeline_dir):
                 with open(fpath) as f:
                     jdata = json.load(f)
                 for t in jdata.get('tests', []):
+                    nodeid = t.get('nodeid', '')
+                    kind = _detect_test_kind(nodeid)
                     tests.append({
-                        'n': t.get('nodeid', ''),
+                        'n': _transform_nodeid(nodeid, mat_map),
                         'o': t.get('outcome', 'unknown'),
-                        'd': round(t.get('duration', 0), 3)
+                        'd': round(t.get('duration', 0), 3),
+                        'k': kind,
                     })
             except Exception as e:
                 print(f"Warning: {jf} parse error: {e}", file=sys.stderr)

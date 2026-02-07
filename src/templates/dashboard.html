@@ -112,6 +112,15 @@
     .test-summary-item { font-size: 0.85rem; color: var(--muted); }
     .test-summary-item strong { color: var(--text); font-size: 1.05rem; }
     .empty-state { text-align: center; padding: 3rem 2rem; color: var(--muted); font-size: 0.95rem; }
+    .kind-filters { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .kind-btn { padding: 0.35rem 0.85rem; border: 1px solid var(--border); border-radius: 16px; background: var(--card); cursor: pointer; font-size: 0.82rem; font-weight: 500; color: var(--muted); transition: all 0.2s; }
+    .kind-btn:hover { border-color: var(--primary); color: var(--primary); }
+    .kind-btn.active { background: var(--primary); color: white; border-color: var(--primary); }
+    .kind-badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 10px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; }
+    .kind-unit { background: #e8f0fe; color: #1a73e8; }
+    .kind-integ { background: #fef7e0; color: #e37400; }
+    .kind-e2e { background: #f3e8fd; color: #8430ce; }
+    .kind-sub { margin: 0.25rem 0 0.5rem 1rem; font-size: 0.78rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; padding: 0.4rem 0.75rem; border-left: 3px solid var(--border); }
     @media (max-width: 600px) {
       .container { padding: 1rem; }
       .grid { grid-template-columns: 1fr 1fr; }
@@ -197,6 +206,12 @@
     </div>
     <div id="tab-tests" class="tab-content">
       <div id="test-summary" class="test-summary-bar"></div>
+      <div class="kind-filters">
+        <button class="kind-btn active" onclick="filterKind('all',this)">All</button>
+        <button class="kind-btn" onclick="filterKind('unit',this)">Unit</button>
+        <button class="kind-btn" onclick="filterKind('integ',this)">Integration</button>
+        <button class="kind-btn" onclick="filterKind('e2e',this)">E2E</button>
+      </div>
       <div class="search-bar"><input type="text" id="test-search" placeholder="Search tests by name, file, or class..." oninput="filterTests()"></div>
       <div id="test-groups"></div>
     </div>
@@ -208,16 +223,99 @@
   <script src="data.js"></script>
   <script>
   (function(){
-    var D=window.PIPELINE_DATA||{files:[],tests:[]};var sCol='c',sAsc=false;
+    var D=window.PIPELINE_DATA||{files:[],tests:[]};
+    var sCol='c',sAsc=false,activeKind='all';
+    var kindLabels={unit:'Unit',integ:'Integration',e2e:'E2E'};
     function hue(c){return c>=90?142:c>=70?60:c>=50?30:0;}
-    function renderFileSummary(){var el=document.getElementById('file-summary');if(!el||!D.files.length)return;var ts=0,th=0,tm=0;D.files.forEach(function(f){ts+=f.s;th+=f.h;tm+=f.m;});var avg=ts?Math.round(th/ts*100):0;el.innerHTML='<div class="file-summary-item"><strong>'+D.files.length+'</strong> files analyzed</div><div class="file-summary-item"><strong>'+ts+'</strong> total statements</div><div class="file-summary-item"><strong>'+th+'</strong> covered</div><div class="file-summary-item"><strong>'+tm+'</strong> missed</div><div class="file-summary-item">Avg: <strong>'+avg+'%</strong></div>';}
-    function renderFiles(q){var tbody=document.getElementById('file-tbody');if(!tbody)return;if(!D.files.length){tbody.innerHTML='<tr><td colspan="6" class="empty-state">No file coverage data available</td></tr>';return;}var files=D.files.slice();if(q){var ql=q.toLowerCase();files=files.filter(function(f){return f.f.toLowerCase().indexOf(ql)>=0;});}files.sort(function(a,b){var va=a[sCol],vb=b[sCol];if(typeof va==='string')return sAsc?va.localeCompare(vb):vb.localeCompare(va);return sAsc?va-vb:vb-va;});var html='';files.forEach(function(f){var h=hue(f.c);var link='detail/'+f.f.replace(/\//g,'_').replace(/\./g,'_')+'.html';html+='<tr><td><a class="file-link" href="'+link+'" title="'+f.f+'">'+f.f+'</a></td><td>'+f.s+'</td><td style="color:'+(f.m>0?'var(--danger)':'var(--muted)')+'">'+f.m+'</td><td>'+f.h+'</td><td style="font-weight:700;color:hsl('+h+',70%,40%)">'+f.c+'%</td><td><div class="mini-bar"><div class="mini-fill" style="width:'+f.c+'%;background:hsl('+h+',70%,45%)"></div></div></td></tr>';});if(!html)html='<tr><td colspan="6" class="empty-state">No files match your search</td></tr>';tbody.innerHTML=html;}
+
+    /* ---- File Coverage Tab ---- */
+    function renderFileSummary(){
+      var el=document.getElementById('file-summary');if(!el||!D.files.length)return;
+      var ts=0,th=0,tm=0;D.files.forEach(function(f){ts+=f.s;th+=f.h;tm+=f.m;});
+      var avg=ts?Math.round(th/ts*100):0;
+      el.innerHTML='<div class="file-summary-item"><strong>'+D.files.length+'</strong> files analyzed</div><div class="file-summary-item"><strong>'+ts+'</strong> total statements</div><div class="file-summary-item"><strong>'+th+'</strong> covered</div><div class="file-summary-item"><strong>'+tm+'</strong> missed</div><div class="file-summary-item">Avg: <strong>'+avg+'%</strong></div>';
+    }
+    function renderFiles(q){
+      var tbody=document.getElementById('file-tbody');if(!tbody)return;
+      if(!D.files.length){tbody.innerHTML='<tr><td colspan="6" class="empty-state">No file coverage data available</td></tr>';return;}
+      var files=D.files.slice();
+      if(q){var ql=q.toLowerCase();files=files.filter(function(f){return f.f.toLowerCase().indexOf(ql)>=0;});}
+      files.sort(function(a,b){var va=a[sCol],vb=b[sCol];if(typeof va==='string')return sAsc?va.localeCompare(vb):vb.localeCompare(va);return sAsc?va-vb:vb-va;});
+      var html='';files.forEach(function(f){var h=hue(f.c);var link='detail/'+f.f.replace(/\//g,'_').replace(/\./g,'_')+'.html';html+='<tr><td><a class="file-link" href="'+link+'" title="'+f.f+'">'+f.f+'</a></td><td>'+f.s+'</td><td style="color:'+(f.m>0?'var(--danger)':'var(--muted)')+'">'+f.m+'</td><td>'+f.h+'</td><td style="font-weight:700;color:hsl('+h+',70%,40%)">'+f.c+'%</td><td><div class="mini-bar"><div class="mini-fill" style="width:'+f.c+'%;background:hsl('+h+',70%,45%)"></div></div></td></tr>';});
+      if(!html)html='<tr><td colspan="6" class="empty-state">No files match your search</td></tr>';
+      tbody.innerHTML=html;
+    }
     window.sortFiles=function(col){if(sCol===col)sAsc=!sAsc;else{sCol=col;sAsc=col==='f';}renderFiles(document.getElementById('file-search').value);};
     window.filterFiles=function(){renderFiles(document.getElementById('file-search').value);};
-    function renderTestSummary(){var el=document.getElementById('test-summary');if(!el||!D.tests.length){if(el)el.style.display='none';return;}var p=0,f=0,s=0,e=0;D.tests.forEach(function(t){if(t.o==='passed')p++;else if(t.o==='failed')f++;else if(t.o==='skipped')s++;else e++;});el.innerHTML='<div class="test-summary-item"><strong>'+D.tests.length+'</strong> total tests</div><div class="test-summary-item" style="color:var(--success)"><strong>'+p+'</strong> passed</div>'+(f?'<div class="test-summary-item" style="color:var(--danger)"><strong>'+f+'</strong> failed</div>':'')+(s?'<div class="test-summary-item" style="color:var(--warn)"><strong>'+s+'</strong> skipped</div>':'')+(e?'<div class="test-summary-item" style="color:var(--danger)"><strong>'+e+'</strong> errors</div>':'');}
-    function renderTests(q){var container=document.getElementById('test-groups');if(!container)return;if(!D.tests.length){container.innerHTML='<div class="empty-state">No test results available</div>';return;}var groups={};D.tests.forEach(function(t){var parts=t.n.split('::');var file=parts[0]||'unknown';if(!groups[file])groups[file]=[];groups[file].push({name:parts.slice(1).join(' :: '),outcome:t.o,duration:t.d,raw:t.n});});var keys=Object.keys(groups).sort();if(q){var ql=q.toLowerCase();keys=keys.filter(function(k){if(k.toLowerCase().indexOf(ql)>=0)return true;return groups[k].some(function(t){return t.raw.toLowerCase().indexOf(ql)>=0;});});}var html='';keys.forEach(function(file,idx){var tests=groups[file];if(q){var ql=q.toLowerCase();if(file.toLowerCase().indexOf(ql)<0){tests=tests.filter(function(t){return t.raw.toLowerCase().indexOf(ql)>=0;});}}var passed=tests.filter(function(t){return t.o==='passed';}).length;var failed=tests.filter(function(t){return t.o==='failed';}).length;var bc=failed>0?'badge-failed':'badge-passed';var st=failed>0?failed+' failed':'all passed';html+='<div class="test-group"><div class="test-group-header expanded" onclick="toggleGroup('+idx+')"><span class="chevron open" id="chev-'+idx+'">&#9654;</span><span style="flex:1;word-break:break-all">'+file+'</span><span class="badge '+bc+'">'+st+'</span><span style="color:var(--muted);font-size:0.78rem">'+tests.length+' tests</span></div><div class="test-group-body" id="grp-'+idx+'">';tests.forEach(function(t){var tbc=t.outcome==='passed'?'badge-passed':t.outcome==='failed'?'badge-failed':t.outcome==='skipped'?'badge-skipped':'badge-error';html+='<div class="test-item"><span class="badge '+tbc+'">'+t.outcome+'</span><span class="test-name">'+t.name+'</span><span class="test-duration">'+t.duration+'s</span></div>';});html+='</div></div>';});if(!html)html='<div class="empty-state">No tests match your search</div>';container.innerHTML=html;}
+
+    /* ---- Test Details Tab ---- */
+    function renderTestSummary(){
+      var el=document.getElementById('test-summary');if(!el||!D.tests.length){if(el)el.style.display='none';return;}
+      var p=0,f=0,s=0,e=0,ku=0,ki=0,ke=0;
+      D.tests.forEach(function(t){
+        if(t.o==='passed')p++;else if(t.o==='failed')f++;else if(t.o==='skipped')s++;else e++;
+        if(t.k==='unit')ku++;else if(t.k==='integ')ki++;else if(t.k==='e2e')ke++;
+      });
+      el.innerHTML='<div class="test-summary-item"><strong>'+D.tests.length+'</strong> total</div>'
+        +'<div class="test-summary-item" style="color:var(--success)"><strong>'+p+'</strong> passed</div>'
+        +(f?'<div class="test-summary-item" style="color:var(--danger)"><strong>'+f+'</strong> failed</div>':'')
+        +(s?'<div class="test-summary-item" style="color:var(--warn)"><strong>'+s+'</strong> skipped</div>':'')
+        +(e?'<div class="test-summary-item" style="color:var(--danger)"><strong>'+e+'</strong> errors</div>':'')
+        +'<div class="test-summary-item"><span class="kind-badge kind-unit">'+ku+' unit</span></div>'
+        +(ki?'<div class="test-summary-item"><span class="kind-badge kind-integ">'+ki+' integ</span></div>':'')
+        +(ke?'<div class="test-summary-item"><span class="kind-badge kind-e2e">'+ke+' e2e</span></div>':'');
+    }
+    function renderTests(q){
+      var container=document.getElementById('test-groups');if(!container)return;
+      if(!D.tests.length){container.innerHTML='<div class="empty-state">No test results available</div>';return;}
+      /* Filter by kind */
+      var filtered=D.tests;
+      if(activeKind!=='all'){filtered=filtered.filter(function(t){return t.k===activeKind;});}
+      /* Group by source file */
+      var groups={};
+      filtered.forEach(function(t){
+        var parts=t.n.split('::');var file=parts[0]||'unknown';
+        if(!groups[file])groups[file]=[];
+        groups[file].push({name:parts.slice(1).join(' :: '),outcome:t.o,duration:t.d,kind:t.k||'unit',raw:t.n});
+      });
+      var keys=Object.keys(groups).sort();
+      if(q){var ql=q.toLowerCase();keys=keys.filter(function(k){if(k.toLowerCase().indexOf(ql)>=0)return true;return groups[k].some(function(t){return t.raw.toLowerCase().indexOf(ql)>=0;});});}
+      var html='';var gid=0;
+      keys.forEach(function(file){
+        var tests=groups[file];
+        if(q){var ql=q.toLowerCase();if(file.toLowerCase().indexOf(ql)<0){tests=tests.filter(function(t){return t.raw.toLowerCase().indexOf(ql)>=0;});}}
+        if(!tests.length)return;
+        var passed=tests.filter(function(t){return t.outcome==='passed';}).length;
+        var failed=tests.filter(function(t){return t.outcome==='failed';}).length;
+        var bc=failed>0?'badge-failed':'badge-passed';
+        var st=failed>0?failed+' failed':'all passed';
+        /* Sub-group by kind within each file */
+        var kindMap={};tests.forEach(function(t){var k=t.kind;if(!kindMap[k])kindMap[k]=[];kindMap[k].push(t);});
+        var kindOrder=['unit','integ','e2e'];
+        html+='<div class="test-group"><div class="test-group-header expanded" onclick="toggleGroup('+gid+')">'
+          +'<span class="chevron open" id="chev-'+gid+'">&#9654;</span>'
+          +'<span style="flex:1;word-break:break-all">'+file+'</span>'
+          +'<span class="badge '+bc+'">'+st+'</span>'
+          +'<span style="color:var(--muted);font-size:0.78rem">'+tests.length+' tests</span>'
+          +'</div><div class="test-group-body" id="grp-'+gid+'">';
+        kindOrder.forEach(function(k){
+          var kt=kindMap[k];if(!kt)return;
+          var kclass='kind-'+k;
+          var klabel=kindLabels[k]||k;
+          html+='<div class="kind-sub"><span class="kind-badge '+kclass+'">'+klabel+'</span> &mdash; '+kt.length+' tests</div>';
+          kt.forEach(function(t){
+            var tbc=t.outcome==='passed'?'badge-passed':t.outcome==='failed'?'badge-failed':t.outcome==='skipped'?'badge-skipped':'badge-error';
+            html+='<div class="test-item"><span class="badge '+tbc+'">'+t.outcome+'</span><span class="test-name">'+t.name+'</span><span class="test-duration">'+t.duration+'s</span></div>';
+          });
+        });
+        html+='</div></div>';gid++;
+      });
+      if(!html)html='<div class="empty-state">No tests match your search</div>';
+      container.innerHTML=html;
+    }
     window.toggleGroup=function(idx){var body=document.getElementById('grp-'+idx);var chev=document.getElementById('chev-'+idx);var hdr=chev.parentElement;if(body.style.display==='none'){body.style.display='block';chev.classList.add('open');hdr.classList.add('expanded');}else{body.style.display='none';chev.classList.remove('open');hdr.classList.remove('expanded');}};
     window.filterTests=function(){renderTests(document.getElementById('test-search').value);};
+    window.filterKind=function(kind,btn){activeKind=kind;document.querySelectorAll('.kind-btn').forEach(function(b){b.classList.remove('active');});if(btn)btn.classList.add('active');renderTests(document.getElementById('test-search').value);};
     window.switchTab=function(tab,btn){document.querySelectorAll('.tab-btn').forEach(function(b){b.classList.remove('active');});document.querySelectorAll('.tab-content').forEach(function(c){c.classList.remove('active');c.style.display='none';});var el=document.getElementById('tab-'+tab);if(el){el.classList.add('active');el.style.display='block';}if(btn)btn.classList.add('active');};
     renderFileSummary();renderFiles();renderTestSummary();renderTests();
   })();
