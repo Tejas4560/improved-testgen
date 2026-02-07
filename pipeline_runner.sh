@@ -580,27 +580,12 @@ PYCODE
           echo "Generated tests will NOT be pushed to the repository"
           echo "Tests are still available in $CURRENT_DIR/tests/generated/ for review"
         else
-          # Materialize generated tests: group by source file, deduplicate
+          # Copy AI-generated tests to target repository and commit
           if [ -d "$CURRENT_DIR/tests/generated" ]; then
-            echo ""
-            echo "=================================================================="
-            echo "MATERIALIZING TESTS (source-file mapping)"
-            echo "=================================================================="
-            if python3 "$CURRENT_DIR/src/gen/materialize.py" \
-                "$CURRENT_DIR/tests/generated" \
-                "$PYTHON_ROOT" 2>&1; then
-              echo "Test materialization completed successfully"
-            else
-              echo "Warning: Materialization failed — using original timestamped files"
-            fi
-
             TARGET_TESTS_DIR="$TARGET_DIR/tests/generated"
-            echo ""
             echo "Copying AI-generated tests to target repository: $TARGET_TESTS_DIR"
             mkdir -p "$TARGET_TESTS_DIR"
-            rsync -av --exclude "__pycache__/" --exclude="*.pyc" \
-              --exclude="_materialization_map.json" \
-              "$CURRENT_DIR/tests/generated/" "$TARGET_TESTS_DIR/"
+            rsync -av --exclude "__pycache__/" --exclude="*.pyc" "$CURRENT_DIR/tests/generated/" "$TARGET_TESTS_DIR/"
             echo "AI-generated tests copied to target repository successfully"
 
             # Commit to target repository if it's a git repo
@@ -830,27 +815,13 @@ if [ "$TEST_COUNT" -gt 0 ]; then
         echo "Generated tests will NOT be pushed to the repository"
         echo "Tests are still available in $CURRENT_DIR/tests/generated/ for review"
       else
-        # Materialize generated tests: group by source file, deduplicate
+        # Copy AI-generated tests to target repository and commit
         if [ -d "$CURRENT_DIR/tests/generated" ]; then
-          echo ""
-          echo "=================================================================="
-          echo "MATERIALIZING TESTS (source-file mapping)"
-          echo "=================================================================="
-          if python3 "$CURRENT_DIR/src/gen/materialize.py" \
-              "$CURRENT_DIR/tests/generated" \
-              "$PYTHON_ROOT" 2>&1; then
-            echo "Test materialization completed successfully"
-          else
-            echo "Warning: Materialization failed — using original timestamped files"
-          fi
-
           TARGET_TESTS_DIR="$TARGET_DIR/tests/generated"
           echo ""
           echo "Copying AI-generated tests to target repository: $TARGET_TESTS_DIR"
           mkdir -p "$TARGET_TESTS_DIR"
-          rsync -av --exclude "__pycache__/" --exclude="*.pyc" \
-            --exclude="_materialization_map.json" \
-            "$CURRENT_DIR/tests/generated/" "$TARGET_TESTS_DIR/"
+          rsync -av --exclude "__pycache__/" --exclude="*.pyc" "$CURRENT_DIR/tests/generated/" "$TARGET_TESTS_DIR/"
           echo "AI-generated tests copied to target repository successfully"
 
           # Commit to target repository if it's a git repo
