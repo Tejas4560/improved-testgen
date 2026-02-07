@@ -433,7 +433,7 @@ jobs:
 
       - name: Push Generated Tests to Consumer Repository
         id: push-tests
-        if: inputs.auto_push_tests == 'true'
+        if: inputs.auto_push_tests == 'true' && steps.metrics.outputs.threshold_passed == 'true'
         env:
           GIT_PUSH_TOKEN: ${{ secrets.GIT_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
@@ -530,6 +530,22 @@ jobs:
       - name: Deploy Coverage to GitHub Pages
         id: deploy-pages
         if: always()
+        env:
+          COV_BEFORE: ${{ steps.metrics.outputs.coverage_before }}
+          COV_AFTER: ${{ steps.metrics.outputs.coverage_after }}
+          COV_DELTA: ${{ steps.metrics.outputs.coverage_delta }}
+          TESTS_GEN: ${{ steps.metrics.outputs.tests_generated }}
+          TESTS_PASS: ${{ steps.metrics.outputs.tests_passed }}
+          TESTS_FAIL: ${{ steps.metrics.outputs.tests_failed }}
+          TESTS_TOTAL: ${{ steps.metrics.outputs.tests_total }}
+          THRESHOLD_OK: ${{ steps.metrics.outputs.threshold_passed }}
+          DELTA_OK: ${{ steps.metrics.outputs.delta_passed }}
+          REPO_NAME: ${{ steps.detect-repo.outputs.repo_name }}
+          BRANCH: ${{ steps.detect-repo.outputs.repo_branch }}
+          RUN_NUM: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MIN_COV: ${{ inputs.min_coverage || '90' }}
+          DELTA_REQ: ${{ inputs.delta_threshold || '0' }}
         run: |
           cd ${{ github.workspace }}
 
@@ -539,6 +555,7 @@ jobs:
           fi
 
           echo "Deploying coverage report to GitHub Pages..."
+          export TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
 
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -549,34 +566,49 @@ jobs:
             cd gh-pages-deploy
             git init
             git checkout -b gh-pages
-            echo "# Coverage Reports" > README.md
             touch .nojekyll
             git add .
             git commit -m "Initialize gh-pages"
             cd ..
           }
 
-          REPORT_DIR="coverage/run-${{ github.run_number }}"
-          mkdir -p "gh-pages-deploy/$REPORT_DIR"
-          cp -r pipeline/htmlcov/* "gh-pages-deploy/$REPORT_DIR/"
+          REPORT_DIR="coverage/run-${RUN_NUM}"
+          mkdir -p "gh-pages-deploy/$REPORT_DIR/detail"
 
-          touch gh-pages-deploy/.nojekyll
+          # Copy raw htmlcov into detail/ subdirectory
+          cp -r pipeline/htmlcov/* "gh-pages-deploy/$REPORT_DIR/detail/"
+
+          # Generate dashboard and data.js using Python script
+          python3 pipeline/src/generate_dashboard.py \
+            pipeline/src/templates/dashboard.html \
+            "gh-pages-deploy/$REPORT_DIR" \
+            pipeline
+
+          # Create root redirect to latest run
+          cat > "gh-pages-deploy/index.html" << REDIRECT_EOF
+          <!DOCTYPE html>
+          <html>
+          <head><meta http-equiv="refresh" content="0; url=coverage/run-${RUN_NUM}/index.html"></head>
+          <body><p>Redirecting to <a href="coverage/run-${RUN_NUM}/index.html">latest report</a>...</p></body>
+          </html>
+          REDIRECT_EOF
 
           cd gh-pages-deploy
+          touch .nojekyll
           git add -A
 
           if git diff --staged --quiet; then
             echo "No changes to deploy"
           else
-            git commit -m "Deploy coverage report for run #${{ github.run_number }}"
+            git commit -m "Deploy coverage report for run #${RUN_NUM}"
             git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" 2>/dev/null || git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
             git push origin gh-pages --force
             echo "Coverage report deployed!"
           fi
 
           REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ github.event.repository.name }}"
-          PAGES_URL="https://${REPO_OWNER}.github.io/${REPO_NAME}/coverage/run-${{ github.run_number }}/index.html"
+          REPO_NAME_GH="${{ github.event.repository.name }}"
+          PAGES_URL="https://${REPO_OWNER}.github.io/${REPO_NAME_GH}/coverage/run-${RUN_NUM}/index.html"
 
           echo "pages_url=$PAGES_URL" >> $GITHUB_OUTPUT
           echo "Coverage report: $PAGES_URL"
@@ -584,81 +616,204 @@ jobs:
       - name: Generate Job Summary
         if: always()
         run: |
-          echo "# AI Test Generation Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          # Collect all values
+          REPO_NAME="${{ steps.detect-repo.outputs.repo_name }}"
+          BRANCH="${{ steps.detect-repo.outputs.repo_branch }}"
+          COV_BEFORE="${{ steps.metrics.outputs.coverage_before }}"
+          COV_AFTER="${{ steps.metrics.outputs.coverage_after }}"
+          COV_DELTA="${{ steps.metrics.outputs.coverage_delta }}"
+          TESTS_GEN="${{ steps.metrics.outputs.tests_generated }}"
+          TESTS_PASS="${{ steps.metrics.outputs.tests_passed }}"
+          TESTS_FAIL="${{ steps.metrics.outputs.tests_failed }}"
+          TESTS_TOTAL="${{ steps.metrics.outputs.tests_total }}"
+          THRESHOLD_OK="${{ steps.metrics.outputs.threshold_passed }}"
+          DELTA_OK="${{ steps.metrics.outputs.delta_passed }}"
+          MANUAL_FOUND="${{ steps.metrics.outputs.manual_tests_found }}"
+          MIN_COV="${{ inputs.min_coverage || '90' }}"
+          DELTA_REQ="${{ inputs.delta_threshold || '0' }}"
+          PAGES_URL="${{ steps.deploy-pages.outputs.pages_url }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Determine overall status
+          if [ "$THRESHOLD_OK" = "true" ] && [ "$DELTA_OK" = "true" ]; then
+            STATUS_ICON="<picture><img alt='passed' src='https://img.shields.io/badge/Pipeline-PASSED-brightgreen?style=for-the-badge&logo=githubactions&logoColor=white' /></picture>"
+            STATUS_TEXT="All quality gates passed"
+          else
+            STATUS_ICON="<picture><img alt='failed' src='https://img.shields.io/badge/Pipeline-THRESHOLD%20NOT%20MET-red?style=for-the-badge&logo=githubactions&logoColor=white' /></picture>"
+            STATUS_TEXT="Coverage threshold not met"
+          fi
+
+          # Coverage progress bar (using Unicode block characters)
+          COV_INT=$(python3 -c "print(int(float('$COV_AFTER')))" 2>/dev/null || echo "0")
+          FILLED=$((COV_INT / 5))
+          EMPTY=$((20 - FILLED))
+          BAR=""
+          for i in $(seq 1 $FILLED); do BAR="${BAR}█"; done
+          for i in $(seq 1 $EMPTY); do BAR="${BAR}░"; done
+
+          # Coverage color badge
+          if [ "$COV_INT" -ge 90 ]; then
+            COV_COLOR="brightgreen"
+          elif [ "$COV_INT" -ge 70 ]; then
+            COV_COLOR="yellow"
+          elif [ "$COV_INT" -ge 50 ]; then
+            COV_COLOR="orange"
+          else
+            COV_COLOR="red"
+          fi
+
+          # Pass rate
+          PASS_RATE="0"
+          if [ "$TESTS_TOTAL" != "0" ]; then
+            PASS_RATE=$(python3 -c "print(f'{(int(\"$TESTS_PASS\") / int(\"$TESTS_TOTAL\")) * 100:.0f}')" 2>/dev/null || echo "0")
+          fi
+
+          # Write summary
+          cat >> $GITHUB_STEP_SUMMARY << 'HEADER_EOF'
+          <div align="center">
+
+          # AI Test Generation Pipeline
+
+          **Automated test generation powered by AI for maximum code coverage**
+
+          HEADER_EOF
+
+          echo "${STATUS_ICON}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Repository Info" >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Repository** | \`${{ steps.detect-repo.outputs.repo_name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Branch** | \`${{ steps.detect-repo.outputs.repo_branch }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Run Number** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Triggered By** | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "</div>" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Coverage Metrics" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Value | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          MANUAL_STATUS="None"
-          [ "${{ steps.metrics.outputs.manual_tests_found }}" = "true" ] && MANUAL_STATUS="Found"
-          echo "| **Coverage Before** (Manual Tests) | ${{ steps.metrics.outputs.coverage_before }}% | $MANUAL_STATUS |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Coverage After** (AI + Manual) | ${{ steps.metrics.outputs.coverage_after }}% | - |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Coverage Delta** | ${{ steps.metrics.outputs.coverage_delta }} pp | - |" >> $GITHUB_STEP_SUMMARY
-          THRESHOLD_STATUS="FAILED"
-          [ "${{ steps.metrics.outputs.threshold_passed }}" = "true" ] && THRESHOLD_STATUS="PASSED"
-          echo "| **Target Threshold** | ${{ inputs.min_coverage || '90' }}% | $THRESHOLD_STATUS |" >> $GITHUB_STEP_SUMMARY
-          DELTA_STATUS="FAILED"
-          [ "${{ steps.metrics.outputs.delta_passed }}" = "true" ] && DELTA_STATUS="PASSED"
-          echo "| **Delta Threshold** | ${{ inputs.delta_threshold || '0' }} pp | $DELTA_STATUS |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **AI Generated Test Files** | ${{ steps.metrics.outputs.tests_generated }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Total Tests Run** | ${{ steps.metrics.outputs.tests_total }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Tests Passed** | ${{ steps.metrics.outputs.tests_passed }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Tests Failed** | ${{ steps.metrics.outputs.tests_failed }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
-          echo "[View Interactive Coverage Report](${{ steps.deploy-pages.outputs.pages_url }})" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Add Generated Tests Branch section if auto-push was enabled
-          if [ "${{ inputs.auto_push_tests }}" = "true" ]; then
-            echo "## Generated Tests Branch" >> $GITHUB_STEP_SUMMARY
-            if [ "${{ steps.push-tests.outputs.tests_pushed }}" = "true" ]; then
-              echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-              echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-              echo "| **Branch** | \`${{ inputs.tests_branch || 'ai-generated-tests' }}\` |" >> $GITHUB_STEP_SUMMARY
-              echo "| **Status** | Pushed |" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "[View Branch](${{ steps.push-tests.outputs.tests_branch_url }}) | [Compare with ${{ steps.detect-repo.outputs.repo_branch }}](${{ steps.push-tests.outputs.compare_url }})" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "No new tests were pushed (no changes or no tests generated)" >> $GITHUB_STEP_SUMMARY
-            fi
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "---" >> $GITHUB_STEP_SUMMARY
+          # Repository details
+          echo "### Repository" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **${REPO_NAME}** on branch \`${BRANCH}\` | Run [#${{ github.run_number }}](${RUN_URL}) | Triggered by **${{ github.actor }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Coverage section
+          echo "### Coverage Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<table>" >> $GITHUB_STEP_SUMMARY
+          echo "<tr>" >> $GITHUB_STEP_SUMMARY
+          echo "<td width='50%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Final Coverage**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${BAR} ${COV_AFTER}%" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | Before | After | Change |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Line Coverage** | ${COV_BEFORE}% | **${COV_AFTER}%** | ${COV_DELTA} pp |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "<td width='50%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Quality Gates**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Threshold icons
+          if [ "$THRESHOLD_OK" = "true" ]; then
+            echo "| Check | Required | Actual | Result |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------|----------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Coverage | >= ${MIN_COV}% | ${COV_AFTER}% | **PASSED** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Check | Required | Actual | Result |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------|----------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Coverage | >= ${MIN_COV}% | ${COV_AFTER}% | **FAILED** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "$DELTA_OK" = "true" ]; then
+            echo "| Delta | >= ${DELTA_REQ} pp | ${COV_DELTA} pp | **PASSED** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Delta | >= ${DELTA_REQ} pp | ${COV_DELTA} pp | **FAILED** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "</tr>" >> $GITHUB_STEP_SUMMARY
+          echo "</table>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Test results
+          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<table>" >> $GITHUB_STEP_SUMMARY
+          echo "<tr>" >> $GITHUB_STEP_SUMMARY
+          echo "<td align='center' width='25%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${TESTS_GEN}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Files Generated" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "<td align='center' width='25%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${TESTS_TOTAL}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Total Tests" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "<td align='center' width='25%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${TESTS_PASS}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Passed" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "<td align='center' width='25%'>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${TESTS_FAIL}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Failed" >> $GITHUB_STEP_SUMMARY
+          echo "</td>" >> $GITHUB_STEP_SUMMARY
+          echo "</tr>" >> $GITHUB_STEP_SUMMARY
+          echo "</table>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$TESTS_TOTAL" != "0" ]; then
+            echo "> **Pass Rate: ${PASS_RATE}%** of test cases passed" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
-          echo "## Artifacts" >> $GITHUB_STEP_SUMMARY
-          echo "| Artifact | Description |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------------|" >> $GITHUB_STEP_SUMMARY
-          echo "| \`test-results-${{ github.run_number }}\` | Coverage XML, pytest results |" >> $GITHUB_STEP_SUMMARY
-          echo "| \`coverage-report-${{ github.run_number }}\` | HTML coverage report |" >> $GITHUB_STEP_SUMMARY
-          echo "| \`generated-tests-${{ github.run_number }}\` | AI-generated test files |" >> $GITHUB_STEP_SUMMARY
+          # Manual tests info
+          if [ "$MANUAL_FOUND" = "true" ]; then
+            echo "> Manual tests were detected and included in coverage measurement" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "> No existing tests found — all tests were AI-generated" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Generated Tests Branch section
+          if [ "${{ inputs.auto_push_tests }}" = "true" ]; then
+            echo "### Generated Tests" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.push-tests.outputs.tests_pushed }}" = "true" ]; then
+              echo "> AI-generated tests have been pushed to branch \`${{ inputs.tests_branch || 'ai-generated-tests' }}\`" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "[View Branch](${{ steps.push-tests.outputs.tests_branch_url }}) | [Compare Changes](${{ steps.push-tests.outputs.compare_url }})" >> $GITHUB_STEP_SUMMARY
+            elif [ "$THRESHOLD_OK" != "true" ]; then
+              echo "> Tests were **not pushed** because coverage threshold was not met (${COV_AFTER}% < ${MIN_COV}%)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "> No new tests to push" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Links section
+          echo "### Reports" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Report | Link |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$PAGES_URL" ]; then
+            echo "| Coverage Report | [View Interactive Report](${PAGES_URL}) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "| Test Artifacts | [Download](${RUN_URL}#artifacts) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Generated Tests | \`generated-tests-${{ github.run_number }}\` artifact |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Footer
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          FINAL_STATUS="THRESHOLD NOT MET"
-          [ "${{ steps.metrics.outputs.threshold_passed }}" = "true" ] && FINAL_STATUS="SUCCESS"
-          echo "**Pipeline Status:** $FINAL_STATUS" >> $GITHUB_STEP_SUMMARY
+          echo "<sub>Generated by **AI Test Generation Pipeline** | ${STATUS_TEXT}</sub>" >> $GITHUB_STEP_SUMMARY
 
       - name: Comment on Pull Request
         if: github.event_name == 'pull_request'
@@ -666,32 +821,48 @@ jobs:
         with:
           header: ai-testgen-v2
           message: |
-            ## AI Test Generation Results
+            <h2>AI Test Generation Pipeline</h2>
 
-            ### Coverage Summary
-            | Metric | Before | After | Delta |
-            |--------|--------|-------|-------|
-            | **Line Coverage** | ${{ steps.metrics.outputs.coverage_before }}% | ${{ steps.metrics.outputs.coverage_after }}% | ${{ steps.metrics.outputs.coverage_delta }} pp |
+            <table>
+            <tr>
+            <td width="50%">
 
-            ### Thresholds
-            | Check | Required | Actual | Status |
-            |-------|----------|--------|--------|
-            | Coverage | >= ${{ inputs.min_coverage || '90' }}% | ${{ steps.metrics.outputs.coverage_after }}% | ${{ steps.metrics.outputs.threshold_passed == 'true' && 'PASSED' || 'FAILED' }} |
-            | Delta | >= ${{ inputs.delta_threshold || '0' }} pp | ${{ steps.metrics.outputs.coverage_delta }} pp | ${{ steps.metrics.outputs.delta_passed == 'true' && 'PASSED' || 'FAILED' }} |
+            **Coverage**
 
-            ### Tests
-            - **Generated**: ${{ steps.metrics.outputs.tests_generated }} files
-            - **Passed**: ${{ steps.metrics.outputs.tests_passed }}
-            - **Failed**: ${{ steps.metrics.outputs.tests_failed }}
+            | | Before | After | Delta |
+            |---|:---:|:---:|:---:|
+            | Line Coverage | ${{ steps.metrics.outputs.coverage_before }}% | **${{ steps.metrics.outputs.coverage_after }}%** | ${{ steps.metrics.outputs.coverage_delta }} pp |
 
-            ### Links
-            - [Coverage Report](${{ steps.deploy-pages.outputs.pages_url }})
-            - [Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            ${{ inputs.auto_push_tests == 'true' && steps.push-tests.outputs.tests_pushed == 'true' && format('- [Generated Tests Branch]({0})', steps.push-tests.outputs.tests_branch_url) || '' }}
-            ${{ inputs.auto_push_tests == 'true' && steps.push-tests.outputs.tests_pushed == 'true' && format('- [Compare Changes]({0})', steps.push-tests.outputs.compare_url) || '' }}
+            </td>
+            <td width="50%">
+
+            **Quality Gates**
+
+            | Gate | Required | Actual | Status |
+            |---|:---:|:---:|:---:|
+            | Coverage | ${{ inputs.min_coverage || '90' }}% | ${{ steps.metrics.outputs.coverage_after }}% | ${{ steps.metrics.outputs.threshold_passed == 'true' && '**PASSED**' || '**FAILED**' }} |
+            | Delta | ${{ inputs.delta_threshold || '0' }} pp | ${{ steps.metrics.outputs.coverage_delta }} pp | ${{ steps.metrics.outputs.delta_passed == 'true' && '**PASSED**' || '**FAILED**' }} |
+
+            </td>
+            </tr>
+            </table>
+
+            <details>
+            <summary><strong>Test Details</strong> &mdash; ${{ steps.metrics.outputs.tests_generated }} files generated, ${{ steps.metrics.outputs.tests_passed }}/${{ steps.metrics.outputs.tests_total }} passed</summary>
+
+            | Metric | Count |
+            |--------|:-----:|
+            | AI-Generated Test Files | ${{ steps.metrics.outputs.tests_generated }} |
+            | Total Test Cases | ${{ steps.metrics.outputs.tests_total }} |
+            | Passed | ${{ steps.metrics.outputs.tests_passed }} |
+            | Failed | ${{ steps.metrics.outputs.tests_failed }} |
+
+            </details>
+
+            ${{ steps.deploy-pages.outputs.pages_url && format('[Coverage Report]({0})', steps.deploy-pages.outputs.pages_url) || '' }} | [Pipeline Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) ${{ inputs.auto_push_tests == 'true' && steps.push-tests.outputs.tests_pushed == 'true' && format('| [Generated Tests]({0})', steps.push-tests.outputs.tests_branch_url) || '' }}
 
             ---
-            *Run #${{ github.run_number }}*
+            <sub>Run #${{ github.run_number }} | ${{ steps.metrics.outputs.threshold_passed == 'true' && steps.metrics.outputs.delta_passed == 'true' && 'All quality gates passed' || 'Quality gates not met' }} | AI Test Generation Pipeline</sub>
 
       - name: Check Thresholds
         if: always()
